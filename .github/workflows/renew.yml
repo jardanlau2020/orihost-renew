@@ -46,11 +46,13 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           ORIHOST_PROXY: ${{ secrets.ORIHOST_PROXY }}
+          GH_ROTATE_TOKEN: ${{ secrets.GH_ROTATE_TOKEN }}
           RENEWAL_MAX: '21'
           MAX_ATTEMPTS: '5'
         run: |
           # setup_proxy.sh 已將 IS_PROXY/PROXY_SERVER 寫入 GITHUB_ENV（呢個 step 讀得到）
           echo "IS_PROXY=$IS_PROXY | PROXY_SERVER=$PROXY_SERVER"
+          pip install pynacl 2>&1 | tail -1
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
             python orihost_browser_renew.py
 

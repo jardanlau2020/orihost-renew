@@ -253,7 +253,40 @@ def cookie_login(sb, auth_raw: str) -> bool:
         print("  ❌ Cookie 登录失败（仍在登录页），remember 可能失效")
         return False
     print("  ✅ 已登录")
+    save_rotated_cookies(sb)
     return True
+
+
+def save_rotated_cookies(sb):
+    """免登成功后，把浏览器内最新 remember_web cookie 写回 GitHub secret（防一次性轮换）。"""
+    try:
+        import os, base64
+        gt = os.environ.get("GH_ROTATE_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        repo = os.environ.get("GITHUB_REPOSITORY")  # jardanlau2020/orihost-renew
+        if not gt or not repo or "/" not in repo:
+            return  # 本地跑冇環境，靜默跳過
+        val = None
+        for c in sb.driver.get_cookies():
+            if c["name"].startswith("remember_web_"):
+                val = c["value"]
+                break
+        if not val:
+            print("  ℹ️ 浏览器内无 remember_web cookie，跳过写回")
+            return
+        import requests as _rq
+        r = _rq.get(f"https://api.github.com/repos/{repo}/actions/secrets/public-key",
+                    headers={"Authorization": f"Bearer {gt}"}, timeout=20)
+        kd = r.json()
+        from nacl import encoding as _enc, public as _pub
+        pk = _pub.PublicKey(kd["key"].encode(), _enc.Base64Encoder())
+        enc = _pub.SealedBox(pk).encrypt(val.encode())
+        body = {"encrypted_value": base64.b64encode(enc).decode(), "key_id": kd["key_id"]}
+        rr = _rq.put(f"https://api.github.com/repos/{repo}/actions/secrets/ORIHOST_REMEMBER",
+                     headers={"Authorization": f"Bearer {gt}"}, json=body, timeout=20)
+        print(f"  🔁 remember 已轮换写回 secret: HTTP {rr.status_code}")
+        # 同步埋 server IDs（其實唔會變，但保險）
+    except Exception as e:
+        print(f"  ⚠️ 写回 secret 失败（不影响续期）: {str(e)[:120]}")
 
 
 # ---------- 单台续期 ----------
