@@ -9,22 +9,31 @@ on:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Install system dependencies (xvfb for headed browser)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xdotool scrot
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: ⚙ 设置代理 (sing-box)
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-      - name: Run renew
+
+      - name: Run renew (browser 版 - 过 Turnstile)
         env:
           ORIHOST_REMEMBER: ${{ secrets.ORIHOST_REMEMBER }}
           ORIHOST_SERVER_IDS: ${{ secrets.ORIHOST_SERVER_IDS }}
@@ -34,12 +43,22 @@ jobs:
           ORIHOST_SERVER_IDS_2: ${{ secrets.ORIHOST_SERVER_IDS_2 }}
           ORIHOST_REMEMBER_3: ${{ secrets.ORIHOST_REMEMBER_3 }}
           ORIHOST_SERVER_IDS_3: ${{ secrets.ORIHOST_SERVER_IDS_3 }}
-          # 兼容旧变量名（完整 Cookie 串）
-          ORIHOST_COOKIE: ${{ secrets.ORIHOST_COOKIE }}
-          ORIHOST_COOKIE_1: ${{ secrets.ORIHOST_COOKIE_1 }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           ORIHOST_PROXY: ${{ secrets.ORIHOST_PROXY }}
           RENEWAL_MAX: '21'
           MAX_ATTEMPTS: '5'
-        run: python orihost_renew.py
+        run: |
+          # setup_proxy.sh 已將 IS_PROXY/PROXY_SERVER 寫入 GITHUB_ENV（呢個 step 讀得到）
+          echo "IS_PROXY=$IS_PROXY | PROXY_SERVER=$PROXY_SERVER"
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            python orihost_browser_renew.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orihost-shots-${{ github.run_id }}
+          path: |
+            *.png
+          if-no-files-found: ignore
