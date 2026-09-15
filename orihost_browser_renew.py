@@ -57,11 +57,14 @@ def send_tg(msg: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
     try:
-        tg_lib.post(
+        r = tg_lib.post(
             f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg},
+            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML",
+                  "link_preview_options": {"is_disabled": True}},
             timeout=15,
         )
+        ok = r.status_code == 200 and r.json().get("ok")
+        print(f"  📨 TG {'已发送' if ok else '失败: ' + r.text[:80]}")
     except Exception as e:
         print(f"  TG 发送失败: {e}")
 
@@ -266,12 +269,31 @@ def save_rotated_cookies(sb):
         if not gt or not repo or "/" not in repo:
             return  # 本地跑冇環境，靜默跳過
         val = None
-        for c in sb.driver.get_cookies():
+        cookies = None
+        for attempt in range(3):  # driver 重連期間 get_cookies 會斷線，retry 3 次
+            try:
+                cookies = sb.driver.get_cookies()
+                break
+            except Exception:
+                time.sleep(2)
+        if cookies is None:
+            print("  ℹ️ 拿不到浏览器 cookies（driver 断线），跳过写回")
+            return
+        for c in cookies:
             if c["name"].startswith("remember_web_"):
                 val = c["value"]
                 break
+        import json as _json, base64 as _b64, urllib.parse as _up
         if not val:
             print("  ℹ️ 浏览器内无 remember_web cookie，跳过写回")
+            return
+        # 格式驗證：確保係正版 Laravel token（防寫壞 secret 害死下一輪）
+        try:
+            dec = _up.unquote(val)
+            payload = _json.loads(_b64.b64decode(dec + "=" * (-len(dec) % 4)))
+            assert sorted(payload.keys()) == ["iv", "mac", "tag", "value"], payload.keys()
+        except Exception:
+            print(f"  ⚠️ remember 格式异常，跳过写回（防寫壞 secret）: {val[:40]}...")
             return
         import requests as _rq
         r = _rq.get(f"https://api.github.com/repos/{repo}/actions/secrets/public-key",
