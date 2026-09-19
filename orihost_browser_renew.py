@@ -319,6 +319,60 @@ _JS_PATCH_WINDOW_OPEN = """
 
 _JS_GET_ARTICLE_URL = "(function () { return window.__oriArticleUrl || ''; })()"
 
+# 诊断用：钩 XHR，记录面板 /renew/* 请求嘅原始回包（主要想知 dwell_seconds 几多）
+_JS_PATCH_XHR = """
+(function () {
+    if (window.__oriXhrPatched) return 'already';
+    window.__oriXhrPatched = true;
+    var O = XMLHttpRequest.prototype.open, S = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u) { this.__oriUrl = u; return O.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function (b) {
+        var self = this;
+        this.addEventListener('load', function () {
+            if ((self.__oriUrl || '').indexOf('/renew') >= 0) {
+                window.__oriLastRenew = self.__oriUrl + ' [' + self.status + '] ' + String(self.responseText).slice(0, 300);
+            }
+        });
+        return S.apply(this, arguments);
+    };
+    return 'patched';
+})()
+"""
+
+_JS_DIAG = """
+(function () {
+    var b = document.body;
+    var out = {
+        href: location.href.slice(0, 90),
+        patched: !!window.__oriPatched,
+        dummy: !!window.__oriDummyWin,
+        closed: !!(window.__oriDummyWin && window.__oriDummyWin.closed),
+        article: (window.__oriArticleUrl || '').slice(0, 80),
+        renew: (window.__oriLastRenew || '').slice(0, 200),
+        modaltxt: '',
+        state: ''
+    };
+    var all = document.querySelectorAll('div');
+    for (var i = all.length - 1; i >= 0; i--) {
+        var t = all[i].textContent || '';
+        if (t.indexOf('Renew your server') >= 0 && t.length < 900) {
+            out.modaltxt = t.slice(0, 260).replace(/\s+/g, ' ');
+            break;
+        }
+    }
+    if (!out.modaltxt) out.modaltxt = 'no-modal';
+    out.state = (function () {
+        var t = ((b && (b.innerText || b.textContent)) || '').toLowerCase();
+        if (t.indexOf('you renewed recently') >= 0) return 'cooldown';
+        if (t.indexOf('thanks for reading') >= 0) return 'ready';
+        if (t.indexOf('you can claim your renewal in') >= 0) return 'reading';
+        if (t.indexOf('click read article to open') >= 0) return 'confirm';
+        return 'closed';
+    })();
+    return JSON.stringify(out);
+})()
+"""
+
 _JS_MODAL_STATE = """
 (function () {
     var b = document.body;
@@ -454,19 +508,49 @@ def api_renewal(sb, sid):
         return None, str(raw)[:80]
 
 
+def detect_state(sb):
+    """读对话框状态；JS 路返空时退而用 page_source 判断（两路互不依赖）"""
+    try:
+        v = sb.execute_script(_JS_MODAL_STATE) or ""
+    except Exception:
+        v = ""
+    if v:
+        return v
+    src = page_text(sb)
+    if "you renewed recently" in src:
+        return "cooldown"
+    if "thanks for reading" in src:
+        return "ready"
+    if "you can claim your renewal in" in src:
+        return "reading"
+    if "click read article to open" in src:
+        return "confirm"
+    return ""
+
+
+def print_diag(sb, tag=""):
+    try:
+        print(f"    \U0001f9ea 诊断{tag}: {sb.execute_script(_JS_DIAG)}")
+    except Exception as e:
+        print(f"    \U0001f9ea 诊断{tag} 失败: {str(e)[:120]}")
+
+
 def wait_modal_state(sb, target, timeout, note=""):
     """等 Renew 对话框走到指定状态（confirm → reading → ready/closed）"""
     end = time.time() + timeout
     last = ""
+    polls = 0
     while time.time() < end:
-        try:
-            last = sb.execute_script(_JS_MODAL_STATE) or ""
-        except Exception as e:
-            last = "err:" + str(e)[:60]
+        polls += 1
+        last = detect_state(sb)
         if last == target:
             return last
-        time.sleep(2)
-    print(f"    （等 {target} 超时{note}，最后状态={last}）")
+        if polls <= 3:
+            print(f"    （第 {polls} 次轮询 state={last!r}）")
+            print_diag(sb, f"#{polls}")
+        time.sleep(3)
+    print(f"    （等 {target} 超时{note}，最后状态={last!r}，轮询 {polls} 次）")
+    print_diag(sb, "最终")
     return last
 
 
@@ -636,6 +720,10 @@ def renew_one_server(sb, server_uuid: str) -> dict:
         print("    ", sb.execute_script(_JS_PATCH_WINDOW_OPEN))
     except Exception as e:
         print("  ⚠️ 垫片失败:", str(e)[:80])
+    try:
+        print("    XHR 诊断钩:", sb.execute_script(_JS_PATCH_XHR))
+    except Exception as e:
+        print("  ⚠️ XHR 钩失败:", str(e)[:80])
 
     print("  🖱️ 点 Read Article...")
     read_res = click_by_text(sb, "read article", timeout=15)
@@ -653,11 +741,19 @@ def renew_one_server(sb, server_uuid: str) -> dict:
             break
         time.sleep(1)
     art_target = None
+    try:
+        print(f"    window_handles 开标签前: {sb.driver.window_handles}")
+    except Exception as e:
+        print(f"    （读 window_handles 失败: {str(e)[:60]}）")
     if art_url.startswith("http"):
         print(f"  📰 文章 URL: {art_url[:110]}")
         try:
             art_target = sb.driver.execute_cdp_cmd("Target.createTarget", {"url": art_url}).get("targetId")
             print(f"    ✅ CDP 已开文章标签 targetId={art_target}")
+            try:
+                print(f"    window_handles 开标签后: {sb.driver.window_handles} / 当前={sb.driver.current_window_handle}")
+            except Exception:
+                pass
         except Exception as e:
             print(f"  ⚠️ CDP 开标签失败（{str(e)[:80]}），改用页面内 fetch 兜底")
             try:
