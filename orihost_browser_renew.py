@@ -235,65 +235,106 @@ def page_text(sb) -> str:
         return ""
 
 
-def find_renew_trigger(sb, timeout=25):
-    """页面级续期入口按钮。
+_JS_RENEW_PROBE = """
+var all = document.querySelectorAll('button,a,div,span,p');
+for (var i = 0; i < all.length; i++) {
+    var el = all[i];
+    var t = (el.textContent || '').trim();
+    if (!t || t.length > 40) continue;
+    var lt = t.toLowerCase();
+    if (lt.indexOf('renew limit reached') >= 0) return 'limit';
+    if (lt !== 'renew' && lt !== 'renew server') continue;
+    if (el.querySelector('*')) continue;
+    var r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) continue;
+    var a = el.closest('a');
+    if (a && ((a.getAttribute('href') || '').indexOf('/premium') >= 0)) continue;
+    return 'ok';
+}
+return 'none';
+"""
+
+_JS_CLICK_BY_TEXT = """
+var want = (arguments[0] || '').toLowerCase();
+var exact = arguments[1] === true;
+var all = document.querySelectorAll('button,a,div,span,p,strong');
+for (var i = 0; i < all.length; i++) {
+    var el = all[i];
+    var t = (el.textContent || '').trim();
+    if (!t || t.length > 40) continue;
+    var lt = t.toLowerCase();
+    if (exact ? (lt !== want) : (lt.indexOf(want) < 0)) continue;
+    if (el.querySelector('*')) continue;
+    var r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) continue;
+    var tgt = el.closest('button,a,[role=button]');
+    if (!tgt) { if (!exact) continue; tgt = el; }
+    var href = (tgt.getAttribute && (tgt.getAttribute('href') || '')) || '';
+    if (href.indexOf('/premium') >= 0 || href.indexOf('/services') >= 0) continue;
+    if (tgt.disabled) return 'disabled:' + t;
+    try { tgt.scrollIntoView({block: 'center'}); } catch (e) {}
+    tgt.click();
+    return 'clicked:' + tgt.tagName + ':' + t;
+}
+return 'not-found';
+"""
+
+
+def click_by_text(sb, text, timeout=10, exact=False):
+    """按文案点击。
+
+    面板 UI kit 的 button/a 经 WebDriver 读 .text 会返空字符串（实测 34 个 element 全部读唔到文案），
+    所以主路改用 JS 精确匹配文案节点再 click（事件会冒泡到 React handler），Selenium 只做兜底。
+    返回 'clicked:...' / 'disabled:...' / 'not-found'。
+    """
+    end = time.time() + timeout
+    last = "not-found"
+    while time.time() < end:
+        try:
+            last = sb.execute_script(_JS_CLICK_BY_TEXT, text, exact) or "not-found"
+        except Exception as e:
+            last = "js-err:" + str(e)[:80]
+        if isinstance(last, str) and (last.startswith("clicked") or last.startswith("disabled")):
+            return last
+        time.sleep(1)
+    el = find_button_by_text(sb, text, timeout=2)
+    if el is not None:
+        try:
+            el.click()
+            return "clicked-selenium:" + text
+        except Exception:
+            try:
+                sb.execute_script("arguments[0].click();", el)
+                return "clicked-selenium-js:" + text
+            except Exception:
+                pass
+    return last
+
+
+def open_renew_dialog(sb, timeout=25):
+    """點開续期对话框。
 
     面板 2026-09 改版：服务器页上的入口按钮文案系「Renew」（停权页系「Renew Server」），
     「Renew Now」/「Read Article」只出现在点击之后弹出嘅对话框里面
     （且「Renew Now」只有 ad-free 帐号先见到）。
-    返回 "limit" 表示按钮系「Renew Limit Reached」（已达上限，应当跳过）。
+    返回 'ok' 已点开 / 'limit' 已达上限 / None 找唔到。
     """
     end = time.time() + timeout
+    probe = ""
     while time.time() < end:
-        for tag in ("button", "a"):
-            try:
-                els = sb.find_elements(tag)
-            except Exception:
-                els = []
-            for el in els:
-                try:
-                    if not el.is_displayed():
-                        continue
-                    txt = (el.text or "").strip().lower()
-                except Exception:
-                    continue
-                if not txt or "renew" not in txt:
-                    continue
-                if "renew limit reached" in txt:
-                    return "limit"  # 「Renew Limit Reached」= 未到可续期时间
-                if not txt.startswith("renew"):
-                    continue  # 例如 "Your Premium expires today. Renew now..." 之类文案，唔系按钮
-                try:
-                    href = (el.get_attribute("href") or "").lower()
-                except Exception:
-                    href = ""
-                if "/premium" in href or "/services" in href:
-                    continue  # 升级 / 买服务器广告，唔系续期入口
-                return el
+        try:
+            probe = sb.execute_script(_JS_RENEW_PROBE) or ""
+        except Exception as e:
+            probe = "err:" + str(e)[:80]
+        if probe == "limit":
+            return "limit"
+        if probe == "ok":
+            res = click_by_text(sb, "Renew", timeout=6, exact=True)
+            print(f"  🖱️ 点续期入口: {res}")
+            if str(res).startswith("clicked"):
+                return "ok"
         time.sleep(1)
-
-    # 兜底：面板 UI kit 有機會唔係 <button>/<a>（例如 div/span），用 JS 按精確文案掃
-    js = """
-    var cands = document.querySelectorAll('button,a,div,span');
-    for (var i = 0; i < cands.length; i++) {
-        var el = cands[i];
-        var t = (el.textContent || '').trim();
-        if (t !== 'Renew' && t !== 'Renew Server') continue;
-        if (el.offsetParent === null) continue;
-        var anc = el.closest ? el.closest('a') : null;
-        if (anc && (anc.getAttribute('href') || '').indexOf('/premium') >= 0) continue;
-        var h = el.getAttribute ? (el.getAttribute('href') || '') : '';
-        if (h.indexOf('/premium') >= 0 || h.indexOf('/services') >= 0) continue;
-        return el;
-    }
-    return null;
-    """
-    try:
-        el = sb.execute_script(js)
-        if el is not None:
-            return el
-    except Exception:
-        pass
+    print("    probe:", probe)
     return None
 
 
@@ -316,10 +357,9 @@ def dump_page_debug(sb, sid):
         for el in els:
             try:
                 t = (el.text or "").strip().replace("\n", " ")
-                if t:
-                    out.append(f"[{t[:28]}|disp={el.is_displayed()}|en={el.is_enabled()}]")
-            except Exception:
-                continue
+                out.append("[%s|%s|disp=%s]" % (el.tag_name, t[:24], el.is_displayed()))
+            except Exception as ee:
+                out.append("[ERR:%s]" % str(ee)[:50])
         print("    --- 按钮/链接文案（共 %d 个）---" % len(els))
         print("    " + " ".join(out[:80]))
     except Exception as e:
@@ -449,104 +489,95 @@ def renew_one_server(sb, server_uuid: str) -> dict:
 
     # 1. 打开续期对话框：页面级入口按钮文案系「Renew」（停权页系「Renew Server」）
     print("  🔍 找 Renew 入口按钮...")
-    trigger = find_renew_trigger(sb, timeout=25)
-    if trigger == "limit":
+    state = open_renew_dialog(sb, timeout=25)
+    if state == "limit":
         return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
-    if trigger is None:
+    if state is None:
         dump_page_debug(sb, sid)
-        sb.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+        try:
+            sb.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            pass
         time.sleep(1)
         sb.save_screenshot(f"no_renew_btn_{sid}.png")
         return {"status": "❌ 续期失败", "message": "没找到 Renew 入口按钮（页面结构可能变了）"}
-    try:
-        trigger.click()
-    except Exception:
-        sb.execute_script("arguments[0].click();", trigger)
     time.sleep(4)
 
     # 1b. 对话框里的两种快路
     dlg_src = page_text(sb)
     if "you renewed recently" in dlg_src:
         return {"status": "⏭️ 跳过", "message": "刚续期过，对话框显示冷却中（You renewed recently）"}
+    now_res = click_by_text(sb, "renew now", timeout=5)
+    if str(now_res).startswith("clicked"):
+        print(f"  ⚡ ad-free 帐号：对话框里直接 Renew Now（{now_res}）")
+        return read_renew_result(sb, sid)
+
+    # 2. 点 Read Article（会弹新标签；唔切换窗口，等倒计时自己跑完）
+    print("  🖱️ 点 Read Article...")
+    handles_before = set()
     try:
-        now_btn = find_button_by_text(sb, "renew now", timeout=4)
-        if now_btn is not None and now_btn.is_enabled():
-            print("  ⚡ ad-free 帐号：对话框里直接 Renew Now")
-            try:
-                now_btn.click()
-            except Exception:
-                sb.execute_script("arguments[0].click();", now_btn)
-            return read_renew_result(sb, sid)
+        handles_before = set(sb.driver.window_handles)
     except Exception:
         pass
-
-    # 2. 点 Read Article（会弹新标签）
-    print("  🖱️ 点 Read Article...")
-    read_btn = find_button_by_text(sb, "read article", timeout=15)
-    if read_btn is None:
-        # 可能已经在 reading 状态（倒计时中），直接往下走
-        print("  ℹ️ 没找到 Read Article，可能已在倒计时，直接等待")
-    else:
-        before = set(sb.driver.window_handles)
-        try:
-            read_btn.click()
-        except Exception:
-            sb.execute_script("arguments[0].click();", read_btn)
-        # 等新标签出现
-        article_handle = None
+    read_res = click_by_text(sb, "read article", timeout=15)
+    if str(read_res).startswith("clicked"):
+        print(f"  📰 文章页已打开（{read_res}），停留 {ARTICLE_WAIT}s（提前关闭会被警告）...")
+        # 等新标签真出现
+        opened = False
         for _ in range(10):
             time.sleep(1)
-            after = set(sb.driver.window_handles)
-            new = after - before
-            if new:
-                article_handle = list(new)[0]
+            try:
+                if set(sb.driver.window_handles) - handles_before:
+                    opened = True
+                    break
+            except Exception:
                 break
-        if article_handle is None:
-            return {"status": "❌ 续期失败", "message": "文章页没弹出来（弹窗被拦，请加 --disable-popup-blocking）"}
-        print(f"  📰 文章页已打开，停留 {ARTICLE_WAIT}s（提前关闭会被警告）...")
-        sb.driver.switch_to.window(article_handle)
+        if not opened:
+            print("  ⚠️ 未检测到新标签（可能被弹窗拦截），继续尝试")
         time.sleep(ARTICLE_WAIT)
-        sb.driver.close()
-        sb.driver.switch_to.window(list(before)[0])
-        time.sleep(4)
-
-    # 3. 等倒计时走完（Claim 按钮出现）
-    print("  ⏳ 等倒计时走完，找 Claim Renewal...")
-    claim_btn = find_button_by_text(sb, "claim renewal", timeout=120)
-    if claim_btn is None:
-        sb.save_screenshot(f"no_claim_btn_{sid}.png")
-        return {"status": "❌ 续期失败", "message": "120s 没等到 Claim Renewal（倒计时异常）"}
-
-    # 4. 过 Turnstile（有才点，没有就跳过）
-    try:
-        has_ts = sb.execute_script(_HAS_TURNSTILE_JS)
-    except Exception:
-        has_ts = False
-    if has_ts:
-        if not handle_turnstile(sb):
-            sb.save_screenshot(f"turnstile_fail_{sid}.png")
-            return {"status": "❌ 续期失败", "message": "Turnstile 验证 6 次未通过"}
-    else:
-        print("  ℹ️ 未检测到验证组件")
-
-    # 5. 点 Claim Renewal（等它从 disabled 变可点）
-    print("  🖱️ 点 Claim Renewal...")
-    claimed = False
-    for _ in range(60):
+        # 顺手关掉文章标签（失败唔影响）
         try:
-            btns = [el for el in sb.find_elements("button") if el.is_displayed() and "claim renewal" in (el.text or "").lower()]
-            if btns and btns[0].is_enabled():
-                try:
-                    btns[0].click()
-                except Exception:
-                    sb.execute_script("arguments[0].click();", btns[0])
-                claimed = True
-                break
-        except Exception:
-            pass
-        time.sleep(2)
-    if not claimed:
-        return {"status": " 续期失败", "message": "Claim 按钮一直不可点（倒计时/验证没完成）"}
+            extra = set(sb.driver.window_handles) - handles_before
+            for h in extra:
+                sb.driver.switch_to.window(h)
+                sb.driver.close()
+            if handles_before:
+                sb.driver.switch_to.window(list(handles_before)[0])
+        except Exception as e:
+            print("  ⚠️ 关文章标签失败（唔影响续期）:", str(e)[:80])
+        time.sleep(3)
+    else:
+        # 可能已经在 reading 状态（倒计时中），直接往下走
+        print(f"  ℹ️ 没点到 Read Article（{read_res}），可能已在倒计时，直接等待")
+        time.sleep(3)
+
+    # 3+4+5. 等 Claim 可点（期间过 Turnstile；验证组件可能迟啲先渲染，所以每轮都查）
+    print("  \u23f3 等倒计时走完，找 Claim Renewal...")
+    ts_state = None  # None=未处理过  True=无组件或已过  False=过唔到
+    clicked = False
+    deadline = time.time() + CLAIM_TIMEOUT + 90
+    while time.time() < deadline:
+        res = click_by_text(sb, "claim renewal", timeout=6)
+        sres = str(res)
+        if sres.startswith("clicked"):
+            print(f"  \U0001f5b1\ufe0f 点 Claim Renewal: {sres}")
+            clicked = True
+            break
+        if ts_state is None and (sres.startswith("disabled") or "not-found" in sres):
+            try:
+                has_ts = sb.execute_script(_HAS_TURNSTILE_JS)
+            except Exception:
+                has_ts = False
+            if has_ts:
+                ts_state = handle_turnstile(sb)
+                if ts_state is False:
+                    sb.save_screenshot(f"turnstile_fail_{sid}.png")
+                    return {"status": "\u274c 续期失败", "message": "Turnstile 验证 6 次未通过"}
+            # 冇见到组件就保持 None，下轮再查
+        time.sleep(3)
+    if not clicked:
+        sb.save_screenshot(f"no_claim_btn_{sid}.png")
+        return {"status": "\u274c 续期失败", "message": "等唔到可点嘅 Claim Renewal（倒计时/验证未完成）"}
 
     # 6. 读结果
     return read_renew_result(sb, sid)
