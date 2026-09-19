@@ -245,12 +245,17 @@ _JS_RENEW_PROBE = """
 
 # 注意：SeleniumBase 的 CDP 模式（driver 断线后 is_cdp_swap_needed）会用 cdp.evaluate(script)
 # 执行，唔支持 arguments[..]；所以文案直接嵌进脚本，唔用 execute_script 传参。
+#
+# 两段式定位（run 35450777798 血案：子串匹配「read article」会命中说明段里面嘅
+# <strong>Read Article</strong> 内联字，佢比真正嘅按钮更深 → 拣错元素、白白点咗空气）：
+#   ① 先揀位于互动容器（button/a/[role=button]）内部、树最深嘅候选 → 正路
+#   ② 冇先退而求其次揀任意最深候选
 _JS_CLICK_BY_TEXT = """
 (function () {
     var want = %s;
     var exact = %s;
     var all = document.querySelectorAll('button,a,div,span,p,strong');
-    var match = null, depth = 0;
+    var best = null, bestDepth = -1, fallback = null, fallbackDepth = -1;
     for (var i = 0; i < all.length; i++) {
         var el = all[i];
         var t = (el.textContent || '').trim();
@@ -267,18 +272,78 @@ _JS_CLICK_BY_TEXT = """
         }
         var d = 0, n = el;
         while (n.parentElement) { d++; n = n.parentElement; }
-        if (d > depth) { depth = d; match = el; }
+        var inter = el.closest('button,a,[role=button],[role=tab]');
+        if (inter) {
+            if (d > bestDepth) { bestDepth = d; best = el; }
+        } else if (d > fallbackDepth) { fallbackDepth = d; fallback = el; }
     }
+    var match = best || fallback;
     if (!match) return 'not-found';
-    var tgt = match.closest('button,a,[role=button]')
-           || match.querySelector('button,a,[role=button]')
-           || match;
+    var tgt = match.closest('button,a,[role=button],[role=tab]') || match;
     var href = (tgt.getAttribute && (tgt.getAttribute('href') || '')) || '';
     if (href.indexOf('/premium') >= 0 || href.indexOf('/services') >= 0) return 'not-found';
-    if (tgt.disabled) return 'disabled:' + (tgt.textContent || '').trim().slice(0, 30);
     try { tgt.scrollIntoView({block: 'center'}); } catch (e) {}
+    if (tgt.disabled) return 'disabled:' + (tgt.textContent || '').trim().slice(0, 30);
     tgt.click();
     return 'clicked:' + tgt.tagName + ':' + (tgt.textContent || '').trim().slice(0, 30);
+})()
+"""
+
+
+# 面板「Renew your server」对话框用 window.open('about:blank','_blank') 开文章页。
+# JS 合成 click 冇 user activation → Chrome 直接当弹窗拦截 → window.open 返 null →
+# 面板弹 danger flash 并停在 confirm 状态，永远到唔到 ready（run 35450777798 实证）。
+# 所以先装垫片：返一个假 window，令面板行得落去；真正开文章页由 Python 侧用 CDP 做。
+_JS_PATCH_WINDOW_OPEN = """
+(function () {
+    window.__oriArticleUrl = '';
+    window.__oriDummyWin = null;
+    if (window.__oriPatched) return 'already';
+    window.__oriPatched = true;
+    window.open = function (u, n, f) {
+        var w = { closed: false, opener: null, name: n || '', __oriDummy: true };
+        w.location = {};
+        Object.defineProperty(w.location, 'href', {
+            get: function () { return window.__oriArticleUrl || 'about:blank'; },
+            set: function (v) { window.__oriArticleUrl = v || ''; }
+        });
+        w.close = function () { w.closed = true; };
+        w.focus = function () {};
+        window.__oriDummyWin = w;
+        if (u && u !== 'about:blank') { window.__oriArticleUrl = u; }
+        return w;
+    };
+    return 'patched';
+})()
+"""
+
+_JS_GET_ARTICLE_URL = "(function () { return window.__oriArticleUrl || ''; })()"
+
+_JS_MODAL_STATE = """
+(function () {
+    var b = document.body;
+    var t = ((b && (b.innerText || b.textContent)) || '').toLowerCase();
+    if (t.indexOf('you renewed recently') >= 0) return 'cooldown';
+    if (t.indexOf('thanks for reading') >= 0) return 'ready';
+    if (t.indexOf('you can claim your renewal in') >= 0) return 'reading';
+    if (t.indexOf('click read article to open') >= 0) return 'confirm';
+    return 'closed';
+})()
+"""
+
+# 同步 XHR：CDP 模式下 execute_async_script 会走 cdp.evaluate（唔支持 callback）→ 必 timeout，
+# 所以读 API 一律用 sync XHR，唔用 async script。
+_JS_SYNC_GET_SERVER = """
+(function () {
+    try {
+        var x = new XMLHttpRequest();
+        x.open('GET', '/api/client/servers/%s', false);
+        x.setRequestHeader('Accept', 'application/json');
+        x.send(null);
+        var d = JSON.parse(x.responseText);
+        var a = (d && d.attributes) || {};
+        return JSON.stringify({renewal: a.renewal, renewable: a.renewable, status: a.status});
+    } catch (e) { return 'ERR ' + e; }
 })()
 """
 
@@ -348,7 +413,7 @@ def dump_page_debug(sb, sid):
         print("    URL 读取失败:", str(e)[:100])
     try:
         txt = sb.execute_script(
-            "(function(){return document.body ? document.body.innerText : ''})()"
+            "(function(){var b=document.body;return (b&&(b.innerText||b.textContent))||''})()"
         ) or ""
         print("    --- 整页文字（前 1500 字）---")
         print("    " + txt[:1500].replace("\n", " | "))
@@ -372,37 +437,66 @@ def dump_page_debug(sb, sid):
     except Exception as e:
         print("    按钮枚举失败:", str(e)[:120])
     try:
-        js = (
-            "(function(){"
-            "function done(v){if(!window.__oriDone){window.__oriDone=1;cb(v);}}"
-            "var cb=arguments[arguments.length-1];"
-            "setTimeout(function(){done('TIMEOUT(8s)')},8000);"
-            "fetch('/api/client/servers/" + sid + "',{credentials:'include',"
-            "headers:{'Accept':'application/json'}})"
-            ".then(function(r){return r.json()})"
-            ".then(function(d){var a=(d&&d.attributes)||d||{};"
-            "done(JSON.stringify({renewable:a.renewable,renewal:a.renewal,status:a.status,"
-            "keys:Object.keys(a).slice(0,40)}))})"
-            ".catch(function(e){done('ERR '+e)})"
-            "})()"
-        )
-        print("    --- 面板 API ---", sb.execute_async_script(js))
+        print("    --- 面板 API ---", sb.execute_script(_JS_SYNC_GET_SERVER % sid))
     except Exception as e:
         print("    API 诊断失败:", str(e)[:150])
 
 
-def read_renew_result(sb, sid) -> dict:
-    """点完 Claim / Renew Now 之后读页面结果"""
+def api_renewal(sb, sid):
+    """直接同步读面板 API 嘅 renewal 天数（唔靠页面文字，最可信）"""
+    try:
+        raw = sb.execute_script(_JS_SYNC_GET_SERVER % sid)
+    except Exception as e:
+        return None, "err:" + str(e)[:60]
+    try:
+        return json.loads(raw), None
+    except Exception:
+        return None, str(raw)[:80]
+
+
+def wait_modal_state(sb, target, timeout, note=""):
+    """等 Renew 对话框走到指定状态（confirm → reading → ready/closed）"""
+    end = time.time() + timeout
+    last = ""
+    while time.time() < end:
+        try:
+            last = sb.execute_script(_JS_MODAL_STATE) or ""
+        except Exception as e:
+            last = "err:" + str(e)[:60]
+        if last == target:
+            return last
+        time.sleep(2)
+    print(f"    （等 {target} 超时{note}，最后状态={last}）")
+    return last
+
+
+def read_renew_result(sb, sid, days_before=None) -> dict:
+    """点完 Claim / Renew Now 之后读结果。
+
+    面板成功后会 window.location.reload()，所以先用 API 对比续期天数最稳，
+    页面文字只做辅助（唔再靠 'renewed' 之类模糊关键字）。
+    """
     time.sleep(8)
     src = page_text(sb)
     if "renew limit reached" in src:
-        return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
-    if any(k in src for k in ("renewed", "successfully renewed", "renewal successful", "extended")):
-        return {"status": "✅ 续期成功", "message": "Claim 成功（页面确认）"}
-    if "captcha" in src and "complete" in src:
-        return {"status": "❌ 续期失败", "message": "提交后仍提示先完成验证"}
+        return {"status": "\u23ed\ufe0f 跳过", "message": "已达续期上限（Renew Limit Reached）"}
+    info, err = api_renewal(sb, sid)
+    if info:
+        days = info.get("renewal")
+        print(f"    API：renewal={days} renewable={info.get('renewable')} status={info.get('status')}")
+        if days_before is not None and isinstance(days, (int, float)) and days > days_before:
+            return {"status": "\u2705 续期成功",
+                    "message": f"续期天数 {days_before} → {days} 天（+{round(days - days_before)}）"}
+        if days_before is not None and days == days_before:
+            sb.save_screenshot(f"claim_noadvance_{sid}.png")
+            return {"status": "\u26a0\ufe0f 未知结果",
+                    "message": f"Claim 已提交，但天数仍系 {days} 天（未后移），请人工确认"}
+    if any(k in src for k in ("renewed successfully", "successfully renewed", "extended")):
+        return {"status": "\u2705 续期成功", "message": "Claim 成功（页面确认）"}
+    if err:
+        print(f"    API 读取失败: {err}")
     sb.save_screenshot(f"claim_unknown_{sid}.png")
-    return {"status": "⚠️ 未知结果", "message": "已点 Claim，但没读到明确成功提示，请人工看一眼面板"}
+    return {"status": "\u26a0\ufe0f 未知结果", "message": "已点 Claim，但没读到明确成功提示，请人工看一眼面板"}
 
 
 # ---------- Cookie 免登 ----------
@@ -497,6 +591,13 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     src = page_text(sb)
     if "renew limit reached" in src:
         return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
+    days_before = None
+    info, err = api_renewal(sb, sid)
+    if info:
+        days_before = info.get("renewal")
+        print(f"  📊 续期前：renewal={days_before} 天 renewable={info.get('renewable')} status={info.get('status')}")
+    elif err:
+        print(f"  ⚠️ 读续期天数失败: {err}")
     if "expired renewal" in src or "suspended due" in src:
         print("  ⚠️ 服务器因过期被暂停，走续期流程恢复")
 
@@ -525,52 +626,72 @@ def renew_one_server(sb, server_uuid: str) -> dict:
         print(f"  ⚡ ad-free 帐号：对话框里直接 Renew Now（{now_res}）")
         return read_renew_result(sb, sid)
 
-    # 2. 点 Read Article（会弹新标签；唔切换窗口，等倒计时自己跑完）
-    print("  🖱️ 点 Read Article...")
-    handles_before = set()
+    # 2. 装 window.open 垫片 → 点 Read Article
+    #    面板靠 window.open('about:blank') 开文章页；JS 合成 click 冇 user activation，
+    #    Chrome 直接拦截 → window.open 返 null → 面板弹「Please allow pop-ups」并永远停在
+    #    confirm 状态（run 35450777798 实证：按钮点中咗，但对话框文字冇变、冇新标签）。
+    #    垫片返一个假 window 令面板状态机行得落去；真文章页由 Python 侧用 CDP 开。
+    print("  🩹 装 window.open 垫片...")
     try:
-        handles_before = set(sb.driver.window_handles)
-    except Exception:
-        pass
-    read_res = click_by_text(sb, "read article", timeout=15)
-    if str(read_res).startswith("clicked"):
-        print(f"  📰 文章页已打开（{read_res}），停留 {ARTICLE_WAIT}s（提前关闭会被警告）...")
-        # 等新标签真出现
-        opened = False
-        for _ in range(10):
-            time.sleep(1)
-            try:
-                if set(sb.driver.window_handles) - handles_before:
-                    opened = True
-                    break
-            except Exception:
-                break
-        if not opened:
-            print("  ⚠️ 未检测到新标签（可能被弹窗拦截），继续尝试")
-        time.sleep(ARTICLE_WAIT)
-        # 顺手关掉文章标签（失败唔影响；handles_before 空 = 当初读唔到，千祈唔好乱关窗）
-        if handles_before:
-            try:
-                extra = set(sb.driver.window_handles) - handles_before
-                for h in extra:
-                    sb.driver.switch_to.window(h)
-                    sb.driver.close()
-                sb.driver.switch_to.window(list(handles_before)[0])
-            except Exception as e:
-                print("  ⚠️ 关文章标签失败（唔影响续期）:", str(e)[:80])
-        else:
-            print("  ℹ️ 读唔到 window_handles，文章标签照留（唔影响续期）")
-        time.sleep(3)
-    else:
-        # 可能已经在 reading 状态（倒计时中），直接往下走
-        print(f"  ℹ️ 没点到 Read Article（{read_res}），可能已在倒计时，直接等待")
-        time.sleep(3)
+        print("    ", sb.execute_script(_JS_PATCH_WINDOW_OPEN))
+    except Exception as e:
+        print("  ⚠️ 垫片失败:", str(e)[:80])
 
-    # 3+4+5. 等 Claim 可点（期间过 Turnstile；验证组件可能迟啲先渲染，所以每轮都查）
-    print("  \u23f3 等倒计时走完，找 Claim Renewal...")
-    ts_state = None  # None=未处理过  True=无组件或已过  False=过唔到
+    print("  🖱️ 点 Read Article...")
+    read_res = click_by_text(sb, "read article", timeout=15)
+    print(f"    {read_res}")
+    time.sleep(2)
+
+    # 2b. 等面板 POST /renew/begin 返文章 URL，再真开一个标签去读
+    art_url = ""
+    for _ in range(20):
+        try:
+            art_url = str(sb.execute_script(_JS_GET_ARTICLE_URL) or "")
+        except Exception:
+            art_url = ""
+        if art_url.startswith("http"):
+            break
+        time.sleep(1)
+    art_target = None
+    if art_url.startswith("http"):
+        print(f"  📰 文章 URL: {art_url[:110]}")
+        try:
+            art_target = sb.driver.execute_cdp_cmd("Target.createTarget", {"url": art_url}).get("targetId")
+            print(f"    ✅ CDP 已开文章标签 targetId={art_target}")
+        except Exception as e:
+            print(f"  ⚠️ CDP 开标签失败（{str(e)[:80]}），改用页面内 fetch 兜底")
+            try:
+                sb.execute_script(
+                    "(function(){try{fetch(%s,{credentials:'include',mode:'no-cors'})"
+                    ".catch(function(){})}catch(e){}return 1})()" % json.dumps(art_url)
+                )
+            except Exception as e2:
+                print(f"  ⚠️ fetch 文章页都失败: {str(e2)[:80]}")
+    else:
+        print(f"  ⚠️ 未拿到文章 URL（面板可能仍在 confirm），read_res={read_res}")
+
+    # 2c. 等对话框由 reading 走到 ready（dwell 秒数由面板自己数）
+    print(f"  ⏳ 等文章停留倒计时（最多 {CLAIM_TIMEOUT}s）...")
+    st = wait_modal_state(sb, "ready", CLAIM_TIMEOUT)
+    if st == "cooldown":
+        return {"status": "\u23ed\ufe0f 跳过", "message": "刚续期过，对话框显示冷却中（You renewed recently）"}
+    if st == "confirm":
+        sb.save_screenshot(f"stuck_confirm_{sid}.png")
+        return {"status": "\u274c 续期失败", "message": "对话框卡在 confirm（Read Article 未生效/弹窗被拦）"}
+
+    # 2d. 收尾：关掉文章标签（面板只认自己嘅假 window，关真标签唔影响）
+    if art_target:
+        try:
+            sb.driver.execute_cdp_cmd("Target.closeTarget", {"targetId": art_target})
+            print("    🧹 文章标签已关（面板倒计时照跑）")
+        except Exception:
+            pass
+
+    # 3. 过 Turnstile（如果有）→ 点 Claim Renewal
+    print("  ⏳ 找 Claim Renewal...")
+    ts_state = None
     clicked = False
-    deadline = time.time() + CLAIM_TIMEOUT + 90
+    deadline = time.time() + CLAIM_TIMEOUT
     while time.time() < deadline:
         res = click_by_text(sb, "claim renewal", timeout=6)
         sres = str(res)
@@ -578,7 +699,7 @@ def renew_one_server(sb, server_uuid: str) -> dict:
             print(f"  \U0001f5b1\ufe0f 点 Claim Renewal: {sres}")
             clicked = True
             break
-        if ts_state is None and (sres.startswith("disabled") or "not-found" in sres):
+        if ts_state is None:
             try:
                 has_ts = sb.execute_script(_HAS_TURNSTILE_JS)
             except Exception:
@@ -588,14 +709,15 @@ def renew_one_server(sb, server_uuid: str) -> dict:
                 if ts_state is False:
                     sb.save_screenshot(f"turnstile_fail_{sid}.png")
                     return {"status": "\u274c 续期失败", "message": "Turnstile 验证 6 次未通过"}
-            # 冇见到组件就保持 None，下轮再查
+            else:
+                print(f"    （暂未见 Turnstile，claim 按钮状态: {sres}）")
         time.sleep(3)
     if not clicked:
         sb.save_screenshot(f"no_claim_btn_{sid}.png")
         return {"status": "\u274c 续期失败", "message": "等唔到可点嘅 Claim Renewal（倒计时/验证未完成）"}
 
     # 6. 读结果
-    return read_renew_result(sb, sid)
+    return read_renew_result(sb, sid, days_before)
 
 
 def fmt_msg(status, label, server_uuid, detail):
