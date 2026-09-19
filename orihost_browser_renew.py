@@ -3,7 +3,7 @@
 # Orihost 浏览器自动续期（SeleniumBase + 真浏览器）
 # 背景：面板 claim 接口强制要求 Cloudflare Turnstile token（GET /api/client/renewal/complete?cf-turnstile-response=xxx），
 #       纯 HTTP 调不通（无 token 直接 500），必须用真浏览器点验证。
-# 流程：Cookie 免登 → 服务器页 → Renew Now → Read Article（新标签读文章）→ 倒计时 → 点 Turnstile → Claim Renewal
+# 流程：Cookie 免登 → 服务器页 → Renew（打开对话框）→ Read Article（新标签读文章）→ 倒计时 → 点 Turnstile → Claim Renewal
 # 参考：katabump-renew-main（同款 Turnstile 处理 + xvfb 无头方案）
 
 import os
@@ -235,6 +235,59 @@ def page_text(sb) -> str:
         return ""
 
 
+def find_renew_trigger(sb, timeout=25):
+    """页面级续期入口按钮。
+
+    面板 2026-09 改版：服务器页上的入口按钮文案系「Renew」（停权页系「Renew Server」），
+    「Renew Now」/「Read Article」只出现在点击之后弹出嘅对话框里面
+    （且「Renew Now」只有 ad-free 帐号先见到）。
+    返回 "limit" 表示按钮系「Renew Limit Reached」（已达上限，应当跳过）。
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        for tag in ("button", "a"):
+            try:
+                els = sb.find_elements(tag)
+            except Exception:
+                els = []
+            for el in els:
+                try:
+                    if not el.is_displayed():
+                        continue
+                    txt = (el.text or "").strip().lower()
+                except Exception:
+                    continue
+                if not txt or "renew" not in txt:
+                    continue
+                if "renew limit reached" in txt:
+                    return "limit"  # 「Renew Limit Reached」= 未到可续期时间
+                if not txt.startswith("renew"):
+                    continue  # 例如 "Your Premium expires today. Renew now..." 之类文案，唔系按钮
+                try:
+                    href = (el.get_attribute("href") or "").lower()
+                except Exception:
+                    href = ""
+                if "/premium" in href or "/services" in href:
+                    continue  # 升级 / 买服务器广告，唔系续期入口
+                return el
+        time.sleep(1)
+    return None
+
+
+def read_renew_result(sb, sid) -> dict:
+    """点完 Claim / Renew Now 之后读页面结果"""
+    time.sleep(8)
+    src = page_text(sb)
+    if "renew limit reached" in src:
+        return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
+    if any(k in src for k in ("renewed", "successfully renewed", "renewal successful", "extended")):
+        return {"status": "✅ 续期成功", "message": "Claim 成功（页面确认）"}
+    if "captcha" in src and "complete" in src:
+        return {"status": "❌ 续期失败", "message": "提交后仍提示先完成验证"}
+    sb.save_screenshot(f"claim_unknown_{sid}.png")
+    return {"status": "⚠️ 未知结果", "message": "已点 Claim，但没读到明确成功提示，请人工看一眼面板"}
+
+
 # ---------- Cookie 免登 ----------
 def cookie_login(sb, auth_raw: str) -> bool:
     print("🍪 Cookie 免登...")
@@ -277,6 +330,11 @@ def save_rotated_cookies(sb):
             except Exception:
                 time.sleep(2)
         if cookies is None:
+            try:  # 兜底：driver API 断线时走 CDP 直接读 cookie store
+                cookies = (sb.driver.execute_cdp_cmd("Network.getAllCookies", {}) or {}).get("cookies") or []
+            except Exception:
+                cookies = None
+        if not cookies:
             print("  ℹ️ 拿不到浏览器 cookies（driver 断线），跳过写回")
             return
         for c in cookies:
@@ -325,17 +383,35 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     if "expired renewal" in src or "suspended due" in src:
         print("  ⚠️ 服务器因过期被暂停，走续期流程恢复")
 
-    # 1. 点 Renew Now
-    print("  🔍 找 Renew Now 按钮...")
-    renew_btn = find_button_by_text(sb, "renew now", timeout=20)
-    if renew_btn is None:
+    # 1. 打开续期对话框：页面级入口按钮文案系「Renew」（停权页系「Renew Server」）
+    print("  🔍 找 Renew 入口按钮...")
+    trigger = find_renew_trigger(sb, timeout=25)
+    if trigger == "limit":
+        return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
+    if trigger is None:
         sb.save_screenshot(f"no_renew_btn_{sid}.png")
-        return {"status": "❌ 续期失败", "message": "没找到 Renew Now 按钮（页面结构可能变了）"}
+        return {"status": "❌ 续期失败", "message": "没找到 Renew 入口按钮（页面结构可能变了）"}
     try:
-        renew_btn.click()
+        trigger.click()
     except Exception:
-        sb.execute_script("arguments[0].click();", renew_btn)
+        sb.execute_script("arguments[0].click();", trigger)
     time.sleep(4)
+
+    # 1b. 对话框里的两种快路
+    dlg_src = page_text(sb)
+    if "you renewed recently" in dlg_src:
+        return {"status": "⏭️ 跳过", "message": "刚续期过，对话框显示冷却中（You renewed recently）"}
+    try:
+        now_btn = find_button_by_text(sb, "renew now", timeout=4)
+        if now_btn is not None and now_btn.is_enabled():
+            print("  ⚡ ad-free 帐号：对话框里直接 Renew Now")
+            try:
+                now_btn.click()
+            except Exception:
+                sb.execute_script("arguments[0].click();", now_btn)
+            return read_renew_result(sb, sid)
+    except Exception:
+        pass
 
     # 2. 点 Read Article（会弹新标签）
     print("  🖱️ 点 Read Article...")
@@ -403,19 +479,10 @@ def renew_one_server(sb, server_uuid: str) -> dict:
             pass
         time.sleep(2)
     if not claimed:
-        return {"status": "❌ 续期失败", "message": "Claim 按钮一直不可点（倒计时/验证没完成）"}
-    time.sleep(8)
+        return {"status": " 续期失败", "message": "Claim 按钮一直不可点（倒计时/验证没完成）"}
 
     # 6. 读结果
-    src = page_text(sb)
-    if "renew limit reached" in src:
-        return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
-    if any(k in src for k in ("renewed", "successfully renewed", "renewal successful", "extended")):
-        return {"status": "✅ 续期成功", "message": "Claim 成功（页面确认）"}
-    if "captcha" in src and "complete" in src:
-        return {"status": "❌ 续期失败", "message": "提交后仍提示先完成验证"}
-    sb.save_screenshot(f"claim_unknown_{sid}.png")
-    return {"status": "⚠️ 未知结果", "message": "已点 Claim，但没读到明确成功提示，请人工看一眼面板"}
+    return read_renew_result(sb, sid)
 
 
 def fmt_msg(status, label, server_uuid, detail):
