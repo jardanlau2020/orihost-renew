@@ -422,7 +422,7 @@ def click_by_text(sb, text, timeout=10, exact=False):
     while time.time() < end:
         try:
             raw = sb.execute_script(script)
-            last = "not-found" if raw is None or raw == "" else str(raw)
+            last = "js-null" if raw is None or raw == "" else str(raw)
         except Exception as e:
             last = "js-err:" + str(e)[:90]
             time.sleep(1)
@@ -765,41 +765,20 @@ def renew_one_server(sb, server_uuid: str) -> dict:
         if art_url.startswith("http"):
             break
         time.sleep(1)
-    art_target = None
-    try:
-        print(f"    window_handles 开标签前: {sb.driver.window_handles}")
-    except Exception as e:
-        print(f"    （读 window_handles 失败: {str(e)[:60]}）")
+    # 2b. 唔开真标签：文章页係第三方站（albeu.com），面板根本核验唔到「有冇真读过」，
+    #     而且 Target.createTarget 会搞烂 CDP/pydoll 连線 —— 之后所有 execute_script 静默返 None
+    #     （run 35452477886 实证：js_health 由 'pong:2' 变 None，click 全部误报 not-found）。
+    #     倒计时係面板自己嘅 setInterval，只认佢自己 window.open 返嚟嘅假 window，
+    #     所以照等就得。真要去访问一次文章页，用页面内 fetch 就够。
     if art_url.startswith("http"):
-        print(f"  📰 文章 URL: {art_url[:110]}")
         try:
-            # background=True 关键：唔抢焦点，否则面板标签变后台 →
-            # ① 面板 setInterval 被节流（倒计时走得极慢）② CDP/pydoll 目标漂移到文章页，
-            #    execute_script 静默返 None（run 35452127623 实证：JS 健康检查与状态读取全部 None）
-            art_target = sb.driver.execute_cdp_cmd(
-                "Target.createTarget", {"url": art_url, "background": True}
-            ).get("targetId")
-            print(f"    ✅ CDP 已开文章标签（后台）targetId={art_target}")
-            try:
-                panel_handle = sb.driver.current_window_handle
-                sb.driver.execute_cdp_cmd("Target.activateTarget", {"targetId": panel_handle})
-                print(f"    面板标签已拉返前台: {panel_handle}")
-            except Exception as e:
-                print(f"    （activateTarget 失败: {str(e)[:60]}）")
-            print(f"    JS 健康检查: {js_health(sb)}")
-            try:
-                print(f"    window_handles 开标签后: {sb.driver.window_handles} / 当前={sb.driver.current_window_handle}")
-            except Exception:
-                pass
+            sb.execute_script(
+                "(function(){try{fetch(%s,{credentials:'include',mode:'no-cors'})"
+                ".catch(function(){})}catch(e){}return 'fetched'})()" % json.dumps(art_url)
+            )
+            print("    📄 已用页面内 fetch 触发一次文章请求（唔开新标签）")
         except Exception as e:
-            print(f"  ⚠️ CDP 开标签失败（{str(e)[:80]}），改用页面内 fetch 兜底")
-            try:
-                sb.execute_script(
-                    "(function(){try{fetch(%s,{credentials:'include',mode:'no-cors'})"
-                    ".catch(function(){})}catch(e){}return 1})()" % json.dumps(art_url)
-                )
-            except Exception as e2:
-                print(f"  ⚠️ fetch 文章页都失败: {str(e2)[:80]}")
+            print(f"    （fetch 文章页失败，唔影响倒计时: {str(e)[:60]}）")
     else:
         print(f"  ⚠️ 未拿到文章 URL（面板可能仍在 confirm），read_res={read_res}")
 
@@ -814,14 +793,6 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     if st == "confirm":
         sb.save_screenshot(f"stuck_confirm_{sid}.png")
         return {"status": "\u274c 续期失败", "message": "对话框卡在 confirm（Read Article 未生效/弹窗被拦）"}
-
-    # 2d. 收尾：关掉文章标签（面板只认自己嘅假 window，关真标签唔影响）
-    if art_target:
-        try:
-            sb.driver.execute_cdp_cmd("Target.closeTarget", {"targetId": art_target})
-            print("    🧹 文章标签已关（面板倒计时照跑）")
-        except Exception:
-            pass
 
     # 3. 过 Turnstile（如果有）→ 点 Claim Renewal
     print("  ⏳ 找 Claim Renewal...")
