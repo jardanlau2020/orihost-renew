@@ -271,7 +271,71 @@ def find_renew_trigger(sb, timeout=25):
                     continue  # 升级 / 买服务器广告，唔系续期入口
                 return el
         time.sleep(1)
+
+    # 兜底：面板 UI kit 有機會唔係 <button>/<a>（例如 div/span），用 JS 按精確文案掃
+    js = """
+    var cands = document.querySelectorAll('button,a,div,span');
+    for (var i = 0; i < cands.length; i++) {
+        var el = cands[i];
+        var t = (el.textContent || '').trim();
+        if (t !== 'Renew' && t !== 'Renew Server') continue;
+        if (el.offsetParent === null) continue;
+        var anc = el.closest ? el.closest('a') : null;
+        if (anc && (anc.getAttribute('href') || '').indexOf('/premium') >= 0) continue;
+        var h = el.getAttribute ? (el.getAttribute('href') || '') : '';
+        if (h.indexOf('/premium') >= 0 || h.indexOf('/services') >= 0) continue;
+        return el;
+    }
+    return null;
+    """
+    try:
+        el = sb.execute_script(js)
+        if el is not None:
+            return el
+    except Exception:
+        pass
     return None
+
+
+def dump_page_debug(sb, sid):
+    """搵唔到续期入口时嘅现场取证：整页文字 + 所有 button/a 文案 + 面板 API 的 renewal 字段"""
+    print("  🧪 现场诊断：")
+    try:
+        print("    URL:", sb.get_current_url())
+    except Exception as e:
+        print("    URL 读取失败:", str(e)[:100])
+    try:
+        txt = sb.execute_script("return document.body ? document.body.innerText : ''") or ""
+        print("    --- 整页文字（前 1500 字）---")
+        print("    " + txt[:1500].replace("\n", " | "))
+    except Exception as e:
+        print("    文字读取失败:", str(e)[:100])
+    try:
+        els = sb.find_elements("button") + sb.find_elements("a")
+        out = []
+        for el in els:
+            try:
+                t = (el.text or "").strip().replace("\n", " ")
+                if t:
+                    out.append(f"[{t[:28]}|disp={el.is_displayed()}|en={el.is_enabled()}]")
+            except Exception:
+                continue
+        print("    --- 按钮/链接文案（共 %d 个）---" % len(els))
+        print("    " + " ".join(out[:80]))
+    except Exception as e:
+        print("    按钮枚举失败:", str(e)[:100])
+    try:
+        js = (
+            "var cb=arguments[arguments.length-1];"
+            "fetch('/api/client/servers/" + sid + "',{credentials:'include',headers:{'Accept':'application/json'}})"
+            ".then(function(r){return r.json()})"
+            ".then(function(d){var a=(d&&d.attributes)||d||{};"
+            "cb(JSON.stringify({renewable:a.renewable,renewal:a.renewal,status:a.status,keys:Object.keys(a).slice(0,40)}))})"
+            ".catch(function(e){cb('ERR '+e)})"
+        )
+        print("    --- 面板 API ---", sb.execute_async_script(js))
+    except Exception as e:
+        print("    API 诊断失败:", str(e)[:150])
 
 
 def read_renew_result(sb, sid) -> dict:
@@ -389,6 +453,9 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     if trigger == "limit":
         return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
     if trigger is None:
+        dump_page_debug(sb, sid)
+        sb.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(1)
         sb.save_screenshot(f"no_renew_btn_{sid}.png")
         return {"status": "❌ 续期失败", "message": "没找到 Renew 入口按钮（页面结构可能变了）"}
     try:
