@@ -168,7 +168,112 @@ _HAS_TURNSTILE_JS = """
 """
 
 
+# 面板免费方案会插广告：续期对话框弹出时，中间会有个「Download is ready / Tap to proceed」
+# 嘅固定遮罩（z-index 好高），正好盖住 Turnstile 组件 —— 唔清走佢，点极都点唔到 checkbox
+# （run 35452946138 截图实证：组件白框被广告盖住，Claim Renewal 一直 disabled）。
+_JS_KILL_AD = """
+(function () {
+    var out = [];
+    function hide(el, why) {
+        try {
+            el.style.setProperty('display', 'none', 'important');
+            out.push(why + ':' + el.tagName);
+        } catch (e) {}
+    }
+    var markers = ['download is ready', 'tap to proceed'];
+    var all = document.querySelectorAll('div,section,aside,iframe,ins');
+    for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        var t = (((el.innerText || el.textContent) || '')).toLowerCase().slice(0, 400);
+        if (!t) continue;
+        for (var j = 0; j < markers.length; j++) {
+            if (t.indexOf(markers[j]) < 0) continue;
+            var p = el;
+            for (var k = 0; k < 8 && p.parentElement; k++) {
+                var st = window.getComputedStyle(p);
+                var z = parseInt(st.zIndex || '0', 10);
+                if (st.position === 'fixed' || z >= 100) break;
+                p = p.parentElement;
+            }
+            hide(p, 'marker');
+            break;
+        }
+    }
+    var els = document.querySelectorAll('body > *, body > * > *');
+    for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        var st = window.getComputedStyle(el);
+        var z = parseInt(st.zIndex || '0', 10);
+        if (st.position !== 'fixed' && st.position !== 'absolute') continue;
+        if (z < 900) continue;
+        var r = el.getBoundingClientRect();
+        if (r.width * r.height < 0.2 * window.innerWidth * window.innerHeight) continue;
+        var txt = ((el.innerText || '') + '').toLowerCase();
+        if (txt.indexOf('renew your server') >= 0) continue;
+        hide(el, 'zindex' + z);
+    }
+    return out.join(' ') || 'none';
+})()
+"""
+
+_JS_TS_INFO = """
+(function () {
+    var inp = document.querySelector('input[name="cf-turnstile-response"]');
+    var out = {token: inp ? String(inp.value || '').length : -1, rects: []};
+    var fs = document.querySelectorAll('iframe');
+    for (var i = 0; i < fs.length; i++) {
+        var src = fs[i].src || '';
+        if (src.indexOf('challenges.cloudflare.com') < 0) continue;
+        var r = fs[i].getBoundingClientRect();
+        out.rects.push([Math.round(r.left), Math.round(r.top),
+                        Math.round(r.width), Math.round(r.height)]);
+    }
+    return JSON.stringify(out);
+})()
+"""
+
+
+def kill_ad_overlay(sb):
+    """清走盖住 Turnstile 嘅广告遮罩；返清咗几多个"""
+    try:
+        return sb.execute_script(_JS_KILL_AD)
+    except Exception as e:
+        return "err:" + str(e)[:60]
+
+
+def ts_info(sb):
+    """读 Turnstile 状态：token 长度 + 组件 iframe 视口坐标"""
+    try:
+        raw = sb.execute_script(_JS_TS_INFO)
+    except Exception as e:
+        return None, "err:" + str(e)[:60]
+    try:
+        return json.loads(raw), None
+    except Exception:
+        return None, str(raw)[:80]
+
+
+def ts_click_cdp(sb, x, y):
+    """用 CDP 派发真鼠标事件点 checkbox（唔依赖 X11/pyautogui，坐标係视口坐标）"""
+    try:
+        for t in ("mouseMoved", "mousePressed", "mouseReleased"):
+            sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": t, "x": int(x), "y": int(y), "button": "left", "clickCount": 1,
+            })
+            time.sleep(0.08)
+        return "cdp-ok"
+    except Exception as e:
+        return "cdp-err:" + str(e)[:60]
+
+
 def handle_turnstile(sb) -> bool:
+    """处理续期对话框内嘅 Cloudflare Turnstile。
+
+    经验（run 35452946138）：uc_gui_click_captcha 点极都过唔到，因为
+    ① 面板免费方案会弹广告遮罩（Download is ready）盖住组件
+    ② pyautogui 嘅盲点坐标撞正遮罩
+    所以改成：先清广告 → 读组件 iframe 真实坐标 → 用 CDP 派发真鼠标事件点 checkbox。
+    """
     print("🔍 处理 Cloudflare Turnstile 验证...")
     time.sleep(2)
     try:
@@ -177,34 +282,40 @@ def handle_turnstile(sb) -> bool:
             return True
     except Exception:
         pass
-    for _ in range(3):
+    for attempt in range(8):
+        killed = kill_ad_overlay(sb)
+        info, err = ts_info(sb)
+        if info is None:
+            print(f"  ⚠️ 读 Turnstile 状态失败: {err}")
+            time.sleep(2)
+            continue
+        tok, rects = info.get("token"), info.get("rects") or []
+        if isinstance(tok, int) and tok > 20:
+            print(f"✅ Turnstile 通过（第 {attempt + 1} 轮，token 长度 {tok}）")
+            return True
+        if attempt == 0:
+            print(f"  组件: token_len={tok} iframe={rects} 清广告={killed}")
+        if not rects:
+            print(f"  ⚠️ 第 {attempt + 1} 轮：未见到 Turnstile iframe，等一等再试")
+            time.sleep(3)
+            continue
         try:
             sb.execute_script(_EXPAND_JS)
         except Exception:
             pass
-        time.sleep(0.5)
-    for attempt in range(6):
-        try:
-            if sb.execute_script(_SOLVED_JS):
-                print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
+        x, y, w, h = rects[0]
+        # checkbox 喺组件左侧约 24px 处、垂直居中
+        cx, cy = x + 24, y + max(h // 2, 16)
+        res = ts_click_cdp(sb, cx, cy)
+        print(f"  ️ 第 {attempt + 1} 轮点 checkbox ({cx},{cy}) → {res}")
+        for _ in range(10):
+            time.sleep(1)
+            info, _ = ts_info(sb)
+            if info and isinstance(info.get("token"), int) and info["token"] > 20:
+                print(f"✅ Turnstile 通过（第 {attempt + 1} 轮，token 长度 {info['token']}）")
                 return True
-        except Exception:
-            pass
-        print(f"🖱️ 第 {attempt + 1} 次调用 uc_gui_click_captcha...")
-        try:
-            sb.uc_gui_click_captcha()
-        except Exception as e:
-            print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
-        for _ in range(16):
-            time.sleep(0.5)
-            try:
-                if sb.execute_script(_SOLVED_JS):
-                    print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试）")
-                    return True
-            except Exception:
-                pass
-        print(f"⚠️ 第 {attempt + 1} 次未通过，重试...")
-    print("  ❌ Turnstile 6 次均失败")
+        print(f"  ⚠️ 第 {attempt + 1} 轮未通过，重试...")
+    print("  ❌ Turnstile 8 轮均失败")
     return False
 
 
