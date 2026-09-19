@@ -808,16 +808,22 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     sb.open(f"{PANEL}/server/{sid}")
     time.sleep(8)
 
-    src = page_text(sb)
-    if "renew limit reached" in src:
-        return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
+    # 先读面板 API 真实状态（最可信）：renewable=False 或 renewal>=18 就係已达上限
     days_before = None
     info, err = api_renewal(sb, sid)
     if info:
         days_before = info.get("renewal")
         print(f"  📊 续期前：renewal={days_before} 天 renewable={info.get('renewable')} status={info.get('status')}")
+        d = days_before
+        if info.get("renewable") is False or (isinstance(d, (int, float)) and d >= 18):
+            return {"status": "\u23ed\ufe0f 跳过",
+                    "message": f"已达续期上限（API: renewal={d} 天 renewable={info.get('renewable')}）"}
     elif err:
         print(f"  ⚠️ 读续期天数失败: {err}")
+
+    src = page_text(sb)
+    if "renew limit reached" in src:
+        return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
     if "expired renewal" in src or "suspended due" in src:
         print("  ⚠️ 服务器因过期被暂停，走续期流程恢复")
 
