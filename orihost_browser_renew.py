@@ -214,9 +214,13 @@ def page_text(sb) -> str:
         return ""
 
 
+# 面板入口按钮名字系「Renew」（停权页「Renew Server」），且按钮内可能只有裸文字节点 + SVG 图标
+# （run 35450509946 实测：BUTTON[Renew] 存在，但旧逻辑要求「无子元素」→ 误判为冇按钮）。
+# 所以改成：先收集所有文案精确匹配的节点，取**树最深**嘅一个做锚点。
 _JS_RENEW_PROBE = """
 (function () {
-    var all = document.querySelectorAll('button,a,div,span,p');
+    var all = document.querySelectorAll('button,a,div,span,p,strong');
+    var match = null, depth = 0;
     for (var i = 0; i < all.length; i++) {
         var el = all[i];
         var t = (el.textContent || '').trim();
@@ -224,17 +228,18 @@ _JS_RENEW_PROBE = """
         var lt = t.toLowerCase();
         if (lt.indexOf('renew limit reached') >= 0) return 'limit';
         if (lt !== 'renew' && lt !== 'renew server') continue;
-        if (el.querySelector('*')) continue;
         var r = el.getBoundingClientRect();
-        if (r.width === 0 && r.height === 0) continue;
+        if (r.width === 0 && r.height === 0 && el.offsetParent === null) continue;
         var a = el.closest('a');
         if (a) {
             var h = a.getAttribute('href') || '';
             if (h.indexOf('/premium') >= 0 || h.indexOf('/services') >= 0) continue;
         }
-        return 'ok';
+        var d = 0, n = el;
+        while (n.parentElement) { d++; n = n.parentElement; }
+        if (d > depth) { depth = d; match = el; }
     }
-    return 'none';
+    return match ? 'ok' : 'none';
 })()
 """
 
@@ -245,26 +250,35 @@ _JS_CLICK_BY_TEXT = """
     var want = %s;
     var exact = %s;
     var all = document.querySelectorAll('button,a,div,span,p,strong');
+    var match = null, depth = 0;
     for (var i = 0; i < all.length; i++) {
         var el = all[i];
         var t = (el.textContent || '').trim();
-        if (!t || t.length > 40) continue;
+        if (!t || t.length > 60) continue;
         var lt = t.toLowerCase();
         if (exact) { if (lt !== want) continue; }
         else if (lt.indexOf(want) < 0) continue;
-        if (el.querySelector('*')) continue;
         var r = el.getBoundingClientRect();
-        if (r.width === 0 && r.height === 0) continue;
-        var tgt = el.closest('button,a,[role=button]') || (exact ? el : null);
-        if (!tgt) continue;
-        var href = (tgt.getAttribute && (tgt.getAttribute('href') || '')) || '';
-        if (href.indexOf('/premium') >= 0 || href.indexOf('/services') >= 0) continue;
-        if (tgt.disabled) return 'disabled:' + t;
-        try { tgt.scrollIntoView({block: 'center'}); } catch (e) {}
-        tgt.click();
-        return 'clicked:' + tgt.tagName + ':' + t;
+        if (r.width === 0 && r.height === 0 && el.offsetParent === null) continue;
+        var anc = el.closest('a');
+        if (anc) {
+            var ah = anc.getAttribute('href') || '';
+            if (ah.indexOf('/premium') >= 0 || ah.indexOf('/services') >= 0) continue;
+        }
+        var d = 0, n = el;
+        while (n.parentElement) { d++; n = n.parentElement; }
+        if (d > depth) { depth = d; match = el; }
     }
-    return 'not-found';
+    if (!match) return 'not-found';
+    var tgt = match.closest('button,a,[role=button]')
+           || match.querySelector('button,a,[role=button]')
+           || match;
+    var href = (tgt.getAttribute && (tgt.getAttribute('href') || '')) || '';
+    if (href.indexOf('/premium') >= 0 || href.indexOf('/services') >= 0) return 'not-found';
+    if (tgt.disabled) return 'disabled:' + (tgt.textContent || '').trim().slice(0, 30);
+    try { tgt.scrollIntoView({block: 'center'}); } catch (e) {}
+    tgt.click();
+    return 'clicked:' + tgt.tagName + ':' + (tgt.textContent || '').trim().slice(0, 30);
 })()
 """
 
@@ -360,13 +374,16 @@ def dump_page_debug(sb, sid):
     try:
         js = (
             "(function(){"
-            "return fetch('/api/client/servers/" + sid + "',{credentials:'include',"
+            "function done(v){if(!window.__oriDone){window.__oriDone=1;cb(v);}}"
+            "var cb=arguments[arguments.length-1];"
+            "setTimeout(function(){done('TIMEOUT(8s)')},8000);"
+            "fetch('/api/client/servers/" + sid + "',{credentials:'include',"
             "headers:{'Accept':'application/json'}})"
             ".then(function(r){return r.json()})"
             ".then(function(d){var a=(d&&d.attributes)||d||{};"
-            "return JSON.stringify({renewable:a.renewable,renewal:a.renewal,status:a.status,"
-            "keys:Object.keys(a).slice(0,40)})})"
-            ".catch(function(e){return 'ERR '+e})"
+            "done(JSON.stringify({renewable:a.renewable,renewal:a.renewal,status:a.status,"
+            "keys:Object.keys(a).slice(0,40)}))})"
+            ".catch(function(e){done('ERR '+e)})"
             "})()"
         )
         print("    --- 面板 API ---", sb.execute_async_script(js))
