@@ -6,6 +6,7 @@
 # 流程：Cookie 免登 → 服务器页 → Renew（打开对话框）→ Read Article（新标签读文章）→ 倒计时 → 点 Turnstile → Claim Renewal
 # 参考：katabump-renew-main（同款 Turnstile 处理 + xvfb 无头方案）
 
+import json
 import os
 import sys
 import time
@@ -206,28 +207,6 @@ def handle_turnstile(sb) -> bool:
     return False
 
 
-# ---------- 页面工具（文本匹配按钮，面板是 React，文本最稳） ----------
-def find_button_by_text(sb, *keywords, timeout=10):
-    """在 button 和 a 里找文本包含关键词的第一个可见元素"""
-    end = time.time() + timeout
-    kws = [k.lower() for k in keywords]
-    while time.time() < end:
-        try:
-            for el in sb.find_elements("button") + sb.find_elements("a"):
-                try:
-                    if not el.is_displayed():
-                        continue
-                    txt = (el.text or "").strip().lower()
-                    if txt and any(k in txt for k in kws):
-                        return el
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        time.sleep(1)
-    return None
-
-
 def page_text(sb) -> str:
     try:
         return (sb.get_page_source() or "").lower()
@@ -236,78 +215,86 @@ def page_text(sb) -> str:
 
 
 _JS_RENEW_PROBE = """
-var all = document.querySelectorAll('button,a,div,span,p');
-for (var i = 0; i < all.length; i++) {
-    var el = all[i];
-    var t = (el.textContent || '').trim();
-    if (!t || t.length > 40) continue;
-    var lt = t.toLowerCase();
-    if (lt.indexOf('renew limit reached') >= 0) return 'limit';
-    if (lt !== 'renew' && lt !== 'renew server') continue;
-    if (el.querySelector('*')) continue;
-    var r = el.getBoundingClientRect();
-    if (r.width === 0 && r.height === 0) continue;
-    var a = el.closest('a');
-    if (a && ((a.getAttribute('href') || '').indexOf('/premium') >= 0)) continue;
-    return 'ok';
-}
-return 'none';
+(function () {
+    var all = document.querySelectorAll('button,a,div,span,p');
+    for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        var t = (el.textContent || '').trim();
+        if (!t || t.length > 40) continue;
+        var lt = t.toLowerCase();
+        if (lt.indexOf('renew limit reached') >= 0) return 'limit';
+        if (lt !== 'renew' && lt !== 'renew server') continue;
+        if (el.querySelector('*')) continue;
+        var r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) continue;
+        var a = el.closest('a');
+        if (a) {
+            var h = a.getAttribute('href') || '';
+            if (h.indexOf('/premium') >= 0 || h.indexOf('/services') >= 0) continue;
+        }
+        return 'ok';
+    }
+    return 'none';
+})()
 """
 
+# 注意：SeleniumBase 的 CDP 模式（driver 断线后 is_cdp_swap_needed）会用 cdp.evaluate(script)
+# 执行，唔支持 arguments[..]；所以文案直接嵌进脚本，唔用 execute_script 传参。
 _JS_CLICK_BY_TEXT = """
-var want = (arguments[0] || '').toLowerCase();
-var exact = arguments[1] === true;
-var all = document.querySelectorAll('button,a,div,span,p,strong');
-for (var i = 0; i < all.length; i++) {
-    var el = all[i];
-    var t = (el.textContent || '').trim();
-    if (!t || t.length > 40) continue;
-    var lt = t.toLowerCase();
-    if (exact ? (lt !== want) : (lt.indexOf(want) < 0)) continue;
-    if (el.querySelector('*')) continue;
-    var r = el.getBoundingClientRect();
-    if (r.width === 0 && r.height === 0) continue;
-    var tgt = el.closest('button,a,[role=button]');
-    if (!tgt) { if (!exact) continue; tgt = el; }
-    var href = (tgt.getAttribute && (tgt.getAttribute('href') || '')) || '';
-    if (href.indexOf('/premium') >= 0 || href.indexOf('/services') >= 0) continue;
-    if (tgt.disabled) return 'disabled:' + t;
-    try { tgt.scrollIntoView({block: 'center'}); } catch (e) {}
-    tgt.click();
-    return 'clicked:' + tgt.tagName + ':' + t;
-}
-return 'not-found';
+(function () {
+    var want = %s;
+    var exact = %s;
+    var all = document.querySelectorAll('button,a,div,span,p,strong');
+    for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        var t = (el.textContent || '').trim();
+        if (!t || t.length > 40) continue;
+        var lt = t.toLowerCase();
+        if (exact) { if (lt !== want) continue; }
+        else if (lt.indexOf(want) < 0) continue;
+        if (el.querySelector('*')) continue;
+        var r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) continue;
+        var tgt = el.closest('button,a,[role=button]') || (exact ? el : null);
+        if (!tgt) continue;
+        var href = (tgt.getAttribute && (tgt.getAttribute('href') || '')) || '';
+        if (href.indexOf('/premium') >= 0 || href.indexOf('/services') >= 0) continue;
+        if (tgt.disabled) return 'disabled:' + t;
+        try { tgt.scrollIntoView({block: 'center'}); } catch (e) {}
+        tgt.click();
+        return 'clicked:' + tgt.tagName + ':' + t;
+    }
+    return 'not-found';
+})()
 """
+
+
+def _js_click_script(text, exact):
+    return _JS_CLICK_BY_TEXT % (json.dumps(text.lower()), "true" if exact else "false")
 
 
 def click_by_text(sb, text, timeout=10, exact=False):
-    """按文案点击。
+    """按文案点击（纯 JS 路）。
 
-    面板 UI kit 的 button/a 经 WebDriver 读 .text 会返空字符串（实测 34 个 element 全部读唔到文案），
-    所以主路改用 JS 精确匹配文案节点再 click（事件会冒泡到 React handler），Selenium 只做兜底。
-    返回 'clicked:...' / 'disabled:...' / 'not-found'。
+    面板 UI kit 嘅 button/a 经 WebDriver 读 .text 全返空（实测 34 个 element 全部系空字符串），
+    而且 driver 断线后 SeleniumBase 会转 CDP 模式、element 属性访问会抛
+    "'NoneType' object is not callable" → 只能用 document.querySelectorAll + click()，
+    事件会冒泡到 React handler，效果等同真人点击。
+    返回 'clicked:...' / 'disabled:...' / 'not-found' / 'js-err:...'
     """
+    script = _js_click_script(text, exact)
     end = time.time() + timeout
     last = "not-found"
     while time.time() < end:
         try:
-            last = sb.execute_script(_JS_CLICK_BY_TEXT, text, exact) or "not-found"
+            last = sb.execute_script(script) or "not-found"
         except Exception as e:
-            last = "js-err:" + str(e)[:80]
-        if isinstance(last, str) and (last.startswith("clicked") or last.startswith("disabled")):
+            last = "js-err:" + str(e)[:90]
+            time.sleep(1)
+            continue
+        if str(last).startswith("clicked") or str(last).startswith("disabled"):
             return last
         time.sleep(1)
-    el = find_button_by_text(sb, text, timeout=2)
-    if el is not None:
-        try:
-            el.click()
-            return "clicked-selenium:" + text
-        except Exception:
-            try:
-                sb.execute_script("arguments[0].click();", el)
-                return "clicked-selenium-js:" + text
-            except Exception:
-                pass
     return last
 
 
@@ -325,12 +312,12 @@ def open_renew_dialog(sb, timeout=25):
         try:
             probe = sb.execute_script(_JS_RENEW_PROBE) or ""
         except Exception as e:
-            probe = "err:" + str(e)[:80]
+            probe = "err:" + str(e)[:90]
         if probe == "limit":
             return "limit"
         if probe == "ok":
-            res = click_by_text(sb, "Renew", timeout=6, exact=True)
-            print(f"  🖱️ 点续期入口: {res}")
+            res = click_by_text(sb, "renew", timeout=6, exact=True)
+            print(f"  \U0001f5b1\ufe0f 点续期入口: {res}")
             if str(res).startswith("clicked"):
                 return "ok"
         time.sleep(1)
@@ -339,39 +326,48 @@ def open_renew_dialog(sb, timeout=25):
 
 
 def dump_page_debug(sb, sid):
-    """搵唔到续期入口时嘅现场取证：整页文字 + 所有 button/a 文案 + 面板 API 的 renewal 字段"""
-    print("  🧪 现场诊断：")
+    """搵唔到续期入口时嘅现场取证：整页文字 + button/a 文案 + 面板 API 的 renewal 字段"""
+    print("  \U0001f9ea 现场诊断：")
     try:
-        print("    URL:", sb.get_current_url())
+        print("    URL:", sb.execute_script("(function(){return location.href})()"))
     except Exception as e:
         print("    URL 读取失败:", str(e)[:100])
     try:
-        txt = sb.execute_script("return document.body ? document.body.innerText : ''") or ""
+        txt = sb.execute_script(
+            "(function(){return document.body ? document.body.innerText : ''})()"
+        ) or ""
         print("    --- 整页文字（前 1500 字）---")
         print("    " + txt[:1500].replace("\n", " | "))
     except Exception as e:
-        print("    文字读取失败:", str(e)[:100])
+        print("    文字读取失败:", str(e)[:120])
     try:
-        els = sb.find_elements("button") + sb.find_elements("a")
-        out = []
-        for el in els:
-            try:
-                t = (el.text or "").strip().replace("\n", " ")
-                out.append("[%s|%s|disp=%s]" % (el.tag_name, t[:24], el.is_displayed()))
-            except Exception as ee:
-                out.append("[ERR:%s]" % str(ee)[:50])
-        print("    --- 按钮/链接文案（共 %d 个）---" % len(els))
-        print("    " + " ".join(out[:80]))
+        js = """
+        (function () {
+            var els = document.querySelectorAll('button,a');
+            var out = [];
+            for (var i = 0; i < els.length; i++) {
+                var e = els[i];
+                var t = (e.textContent || '').trim().slice(0, 24);
+                out.push(e.tagName + '[' + t + '|vis=' + (e.offsetParent !== null) + ']');
+            }
+            return out.join(' ');
+        })()
+        """
+        print("    --- button/a 文案 ---")
+        print("    " + str(sb.execute_script(js))[:1800])
     except Exception as e:
-        print("    按钮枚举失败:", str(e)[:100])
+        print("    按钮枚举失败:", str(e)[:120])
     try:
         js = (
-            "var cb=arguments[arguments.length-1];"
-            "fetch('/api/client/servers/" + sid + "',{credentials:'include',headers:{'Accept':'application/json'}})"
+            "(function(){"
+            "return fetch('/api/client/servers/" + sid + "',{credentials:'include',"
+            "headers:{'Accept':'application/json'}})"
             ".then(function(r){return r.json()})"
             ".then(function(d){var a=(d&&d.attributes)||d||{};"
-            "cb(JSON.stringify({renewable:a.renewable,renewal:a.renewal,status:a.status,keys:Object.keys(a).slice(0,40)}))})"
-            ".catch(function(e){cb('ERR '+e)})"
+            "return JSON.stringify({renewable:a.renewable,renewal:a.renewal,status:a.status,"
+            "keys:Object.keys(a).slice(0,40)})})"
+            ".catch(function(e){return 'ERR '+e})"
+            "})()"
         )
         print("    --- 面板 API ---", sb.execute_async_script(js))
     except Exception as e:
@@ -535,16 +531,18 @@ def renew_one_server(sb, server_uuid: str) -> dict:
         if not opened:
             print("  ⚠️ 未检测到新标签（可能被弹窗拦截），继续尝试")
         time.sleep(ARTICLE_WAIT)
-        # 顺手关掉文章标签（失败唔影响）
-        try:
-            extra = set(sb.driver.window_handles) - handles_before
-            for h in extra:
-                sb.driver.switch_to.window(h)
-                sb.driver.close()
-            if handles_before:
+        # 顺手关掉文章标签（失败唔影响；handles_before 空 = 当初读唔到，千祈唔好乱关窗）
+        if handles_before:
+            try:
+                extra = set(sb.driver.window_handles) - handles_before
+                for h in extra:
+                    sb.driver.switch_to.window(h)
+                    sb.driver.close()
                 sb.driver.switch_to.window(list(handles_before)[0])
-        except Exception as e:
-            print("  ⚠️ 关文章标签失败（唔影响续期）:", str(e)[:80])
+            except Exception as e:
+                print("  ⚠️ 关文章标签失败（唔影响续期）:", str(e)[:80])
+        else:
+            print("  ℹ️ 读唔到 window_handles，文章标签照留（唔影响续期）")
         time.sleep(3)
     else:
         # 可能已经在 reading 状态（倒计时中），直接往下走
