@@ -8,6 +8,7 @@
 
 import json
 import os
+import re
 import sys
 import time
 import random
@@ -420,7 +421,8 @@ def click_by_text(sb, text, timeout=10, exact=False):
     last = "not-found"
     while time.time() < end:
         try:
-            last = sb.execute_script(script) or "not-found"
+            raw = sb.execute_script(script)
+            last = "not-found" if raw is None or raw == "" else str(raw)
         except Exception as e:
             last = "js-err:" + str(e)[:90]
             time.sleep(1)
@@ -508,6 +510,28 @@ def api_renewal(sb, sid):
         return None, str(raw)[:80]
 
 
+_RE_COUNTDOWN = re.compile(r"claim your renewal in[^0-9]{0,140}?(\d{1,4})", re.I)
+
+
+def dialog_countdown(sb):
+    """从 page source 抽对话框倒计时剩余秒数（HTML 里係 claim your renewal in <strong>N</strong>）"""
+    try:
+        src = re.sub(r"\s+", " ", sb.get_page_source() or "")
+    except Exception:
+        return None
+    m = _RE_COUNTDOWN.search(src)
+    return int(m.group(1)) if m else None
+
+
+def js_health(sb):
+    """CDP 模式下 createTarget 后 execute_script 可能静默返 None，先探一探"""
+    try:
+        v = sb.execute_script("(function(){return 'pong:' + (1+1)})()")
+    except Exception as e:
+        return "err:" + str(e)[:60]
+    return repr(v)
+
+
 def detect_state(sb):
     """读对话框状态；JS 路返空时退而用 page_source 判断（两路互不依赖）"""
     try:
@@ -545,12 +569,13 @@ def wait_modal_state(sb, target, timeout, note=""):
         last = detect_state(sb)
         if last == target:
             return last
-        if polls <= 3:
-            print(f"    （第 {polls} 次轮询 state={last!r}）")
-            print_diag(sb, f"#{polls}")
+        cd = dialog_countdown(sb)
+        if polls <= 4 or polls % 5 == 0:
+            print(f"    （第 {polls} 次轮询 state={last!r} 倒计时={cd}）")
+        if polls == 1:
+            print(f"    JS 健康检查: {js_health(sb)}")
         time.sleep(3)
-    print(f"    （等 {target} 超时{note}，最后状态={last!r}，轮询 {polls} 次）")
-    print_diag(sb, "最终")
+    print(f"    （等 {target} 超时{note}，最后状态={last!r}，倒计时={dialog_countdown(sb)}，轮询 {polls} 次）")
     return last
 
 
@@ -748,8 +773,20 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     if art_url.startswith("http"):
         print(f"  📰 文章 URL: {art_url[:110]}")
         try:
-            art_target = sb.driver.execute_cdp_cmd("Target.createTarget", {"url": art_url}).get("targetId")
-            print(f"    ✅ CDP 已开文章标签 targetId={art_target}")
+            # background=True 关键：唔抢焦点，否则面板标签变后台 →
+            # ① 面板 setInterval 被节流（倒计时走得极慢）② CDP/pydoll 目标漂移到文章页，
+            #    execute_script 静默返 None（run 35452127623 实证：JS 健康检查与状态读取全部 None）
+            art_target = sb.driver.execute_cdp_cmd(
+                "Target.createTarget", {"url": art_url, "background": True}
+            ).get("targetId")
+            print(f"    ✅ CDP 已开文章标签（后台）targetId={art_target}")
+            try:
+                panel_handle = sb.driver.current_window_handle
+                sb.driver.execute_cdp_cmd("Target.activateTarget", {"targetId": panel_handle})
+                print(f"    面板标签已拉返前台: {panel_handle}")
+            except Exception as e:
+                print(f"    （activateTarget 失败: {str(e)[:60]}）")
+            print(f"    JS 健康检查: {js_health(sb)}")
             try:
                 print(f"    window_handles 开标签后: {sb.driver.window_handles} / 当前={sb.driver.current_window_handle}")
             except Exception:
@@ -768,7 +805,10 @@ def renew_one_server(sb, server_uuid: str) -> dict:
 
     # 2c. 等对话框由 reading 走到 ready（dwell 秒数由面板自己数）
     print(f"  ⏳ 等文章停留倒计时（最多 {CLAIM_TIMEOUT}s）...")
-    st = wait_modal_state(sb, "ready", CLAIM_TIMEOUT)
+    cd = dialog_countdown(sb)
+    wait_ready = CLAIM_TIMEOUT if not cd else min(max(CLAIM_TIMEOUT, cd + 60), 600)
+    print(f"    （面板报倒计时 {cd}s → 最多等 {wait_ready}s）")
+    st = wait_modal_state(sb, "ready", wait_ready)
     if st == "cooldown":
         return {"status": "\u23ed\ufe0f 跳过", "message": "刚续期过，对话框显示冷却中（You renewed recently）"}
     if st == "confirm":
@@ -787,6 +827,7 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     print("  ⏳ 找 Claim Renewal...")
     ts_state = None
     clicked = False
+    n_try = 0
     deadline = time.time() + CLAIM_TIMEOUT
     while time.time() < deadline:
         res = click_by_text(sb, "claim renewal", timeout=6)
@@ -806,7 +847,11 @@ def renew_one_server(sb, server_uuid: str) -> dict:
                     sb.save_screenshot(f"turnstile_fail_{sid}.png")
                     return {"status": "\u274c 续期失败", "message": "Turnstile 验证 6 次未通过"}
             else:
-                print(f"    （暂未见 Turnstile，claim 按钮状态: {sres}）")
+                pass  # 统一由下面嘅状态行打印
+        if not clicked and ts_state is None:
+            n_try += 1
+            if n_try <= 4 or n_try % 6 == 0:
+                print(f"    （第 {n_try} 次：state={detect_state(sb)!r} 倒计时={dialog_countdown(sb)} claim={sres[:40]}）")
         time.sleep(3)
     if not clicked:
         sb.save_screenshot(f"no_claim_btn_{sid}.png")
