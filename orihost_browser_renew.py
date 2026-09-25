@@ -55,6 +55,17 @@ if (not TG_BOT_TOKEN or not TG_CHAT_ID) and os.environ.get("TG_BOT"):
         pass
 
 
+# ---------- 运行模式 ----------
+# watchdog（默认，排程用）：只读剩余天数 + 到期 TG 提醒，**唔撳续期**。
+#   原因：claim 接口强制 Cloudflare Turnstile，GHA runner IP 实测过唔到
+#   （2026-09-23 run 35815226857 / 35819886961 —— 8 轮 8 次全败，两个出口都唔得）。
+#   自动撳续期的边界退到「提醒」，动作留给人手。
+# renew：真撳续期（只有人手 workflow_dispatch 拣 mode=renew 先用）。
+MODE = (os.environ.get("ORIHOST_MODE") or "watchdog").strip().lower()
+WATCH_DAYS = int(os.environ.get("ORIHOST_WATCH_DAYS") or "7")
+IS_WATCHDOG = MODE != "renew"
+
+
 def send_tg(msg: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
@@ -949,6 +960,25 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     return read_renew_result(sb, sid, days_before)
 
 
+# ---------- watchdog：只讀狀態 ----------
+def watchdog_one(sb, server_uuid: str) -> dict:
+    """排程模式：登入 + 讀面板 API 剩餘天數，唔撳任何續期。"""
+    sid = (server_uuid or "").split("-")[0][:8]
+    print(f"\n  🖥 [{sid}] 讀續期狀態...")
+    sb.open(f"{PANEL}/server/{sid}")
+    time.sleep(8)
+    info, err = api_renewal(sb, sid)
+    if not info:
+        return {"status": "❌ 狀態讀取失敗", "message": f"面板 API 讀唔到（{err}）"}
+    d = info.get("renewal")
+    ren = info.get("renewable")
+    print(f"  📊 renewal={d} 天 renewable={ren} status={info.get('status')}")
+    if isinstance(d, (int, float)) and d <= WATCH_DAYS:
+        return {"status": "⏰ 需人手續期",
+                "message": f"剩 {d} 天（renewable={ren}）→ 去 panel 人手撳 Renew（GHA 過唔到 Turnstile）"}
+    return {"status": "✅ 正常", "message": f"剩 {d} 天（>{WATCH_DAYS} 天，暫唔使理）"}
+
+
 def fmt_msg(status, label, server_uuid, detail):
     sid = (server_uuid or "").split("-")[0][:8]
     return f"🖥 Orihost 浏览器续期\n{status}\n👤 {label}\n🆔 {sid}\n📌 {detail}\n⏰ {now_bj()}（北京）"
@@ -958,6 +988,7 @@ def fmt_msg(status, label, server_uuid, detail):
 def main():
     print("#" * 42)
     print("   Orihost 浏览器自动续期" + ("（代理开）" if IS_PROXY else "（直连）"))
+    print(f"   模式 MODE={MODE}" + ("（watchdog：只讀狀態 + 到期提醒，唔撳續期）" if IS_WATCHDOG else "（renew：真撳續期）"))
     print("#" * 42)
     accounts = load_accounts()
     if not accounts:
@@ -991,15 +1022,29 @@ def main():
                 continue
             for sv in acc["servers"]:
                 try:
-                    r = renew_one_server(sb, sv)
+                    r = watchdog_one(sb, sv) if IS_WATCHDOG else renew_one_server(sb, sv)
                 except Exception as e:
-                    r = {"status": "❌ 续期失败", "message": f"异常: {str(e)[:120]}"}
+                    r = {"status": "❌ 状态读取失败" if IS_WATCHDOG else "❌ 续期失败",
+                         "message": f"异常: {str(e)[:120]}"}
                 info = {"label": label, "server": sv, "status": r["status"], "message": r.get("message", "")}
                 results.append(info)
                 print(f"  {info['status']} {info['message']}")
-                send_tg(fmt_msg(info["status"], label, sv, info["message"]))
+                # watchdog 模式：正常就靜默（唔想日日嘈），只有「到期要人手」或「讀唔到」先出 TG
+                should_tg = True
+                if IS_WATCHDOG and info["status"].startswith("✅"):
+                    should_tg = False
+                if should_tg:
+                    send_tg(fmt_msg(info["status"], label, sv, info["message"]))
                 time.sleep(random.randint(2, 5))
 
+    if IS_WATCHDOG:
+        bad = sum(1 for r in results if r["status"].startswith("❌"))
+        warn = sum(1 for r in results if r["status"].startswith("⏰"))
+        print(f"\n{'=' * 42}\n📊 watchdog 汇总：{len(results)} 台｜{warn} 台需人手續期｜{bad} 台讀唔到\n{'=' * 42}")
+        # 讀唔到狀態才當真失敗（exit 1）；「需人手」係預期狀態，唔應該標紅
+        if bad:
+            sys.exit(1)
+        sys.exit(0)
     ok = sum(1 for r in results if "成功" in r["status"])
     skip = sum(1 for r in results if "跳过" in r["status"])
     fail = len(results) - ok - skip
