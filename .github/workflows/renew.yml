@@ -3,8 +3,20 @@ name: Orihost Auto Renew
 on:
   schedule:
     # 每 3 天一次，UTC 10:00 = 北京时间 18:00（7 天有效期，提前续避免删机）
+    # 2026-09-25 起：排程只做 watchdog —— 讀面板 API 剩餘天數，剩 ≤7 天出 TG 提醒。
+    #   唔再自動撳續期：claim 接口強制 Cloudflare Turnstile，GHA runner IP 實測
+    #   8 輪 8 次全敗（run 35815226857 / 35819886961），加代理都無用 → 屬人手步驟。
     - cron: '0 10 */3 * *'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'watchdog = 只讀狀態+到期提醒（默認）；renew = 真撳續期（GHA 過唔到 Turnstile，預期紅）'
+        required: false
+        default: 'watchdog'
+        type: choice
+        options:
+          - watchdog
+          - renew
 
 jobs:
   renew:
@@ -33,8 +45,11 @@ jobs:
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      - name: Run renew (browser 版 - 过 Turnstile)
+      - name: Run Orihost（watchdog 讀狀態 / renew 真續期）
         env:
+          # 默認 watchdog；只有人手 dispatch 揀 mode=renew 先會真撳續期
+          ORIHOST_MODE: ${{ github.event.inputs.mode || 'watchdog' }}
+          ORIHOST_WATCH_DAYS: '7'
           ORIHOST_REMEMBER: ${{ secrets.ORIHOST_REMEMBER }}
           ORIHOST_SERVER_IDS: ${{ secrets.ORIHOST_SERVER_IDS }}
           ORIHOST_REMEMBER_1: ${{ secrets.ORIHOST_REMEMBER_1 }}
