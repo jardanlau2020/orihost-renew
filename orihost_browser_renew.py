@@ -1122,37 +1122,40 @@ def watchdog_one(sb, server_uuid: str) -> dict:
 
 
 def fmt_msg(status, label, server_uuid, detail):
-    """瘦身版通知: 统计一行 + 该服务器一行（一次只报一台）"""
+    """方案 B (極致精簡人話版): 每台精準兩行，徹底消滅頂部計數器"""
     s = (status or "").strip()
     sid = (server_uuid or "").split("-")[0][:8]
+    name = f"{label}/{sid}"
     reason = _short(detail)
-    manual = False
-    if "成功" in s:
-        tag = "✅ 已續期" + (f" · {reason}" if reason else "")
-        counts = (1, 0, 0)
-    elif s.startswith("✅"):
-        tag = s + (f" · {reason}" if reason else "")
-        counts = (1, 0, 0)
-    elif s.startswith("⏰"):
-        # 需人手續期：唔算失败（工作流照样绿灯），但一定要提人
-        tag = s + (f" · {reason}" if reason else "")
-        counts = (0, 1, 0)
-        manual = True
-    elif "跳过" in s or s.startswith("⏭️"):
-        tag = "⏭️ 未可續" + (f" · {_short(detail, 44)}" if reason else "")
-        counts = (0, 1, 0)
-    else:
-        tag = f"❌ {s.strip('❌⚠️ ')}" + (f" · {reason}" if reason else "")
-        counts = (0, 0, 1)
-        manual = True
+    m = re.search(r"剩\s*(\d+)\s*天", detail or "")
+    rem_days = f"（剩 {m.group(1)} 天）" if m else ""
 
-    lines = [
-        f"🎮 Orihost ｜ {now_local()} ｜ ✅ {counts[0]} ｜ ⏭️ {counts[1]} ｜ ❌ {counts[2]}",
-        f"▪️ {_esc(label)}/{_esc(sid)} · {_esc(tag)}",
-    ]
-    if manual:
-        lines.append("⚠️ 睇 workflow log 排查")
-    return "\n".join(lines)
+    if "成功" in s:
+        l1 = f"✅ {name} · 成功續期{rem_days}"
+        l2 = "ℹ️ 服務已自動展期"
+        return f"{_esc(l1)}\n{_esc(l2)}"
+    elif s.startswith("✅"):
+        # 正常狀態
+        l1 = f"🟢 {name} · 狀態良好{rem_days}"
+        info_part = f"{reason} · " if reason else ""
+        l2 = f"ℹ️ {info_part}未到續期窗口"
+        return f"{_esc(l1)}\n{_esc(l2)}"
+    elif s.startswith("⏰"):
+        # 需人手續期
+        l1 = f"🚨 {name} · 續期未完成{rem_days}"
+        note = reason or "需人手續期"
+        l2 = f"⚠️ {note} · 請登入面板手動處理"
+        return f"{_esc(l1)}\n{_esc(l2)}"
+    elif "跳过" in s or s.startswith("⏭️"):
+        l1 = f"🟢 {name} · 狀態良好{rem_days}"
+        info_part = f"{reason} · " if reason else ""
+        l2 = f"ℹ️ {info_part}未到續期窗口"
+        return f"{_esc(l1)}\n{_esc(l2)}"
+    else:
+        l1 = f"🚨 {name} · 續期未完成{rem_days}"
+        err = reason or s.strip("❌⚠️ ") or "執行失敗"
+        l2 = f"⚠️ {err} · 請登入面板手動處理"
+        return f"{_esc(l1)}\n{_esc(l2)}"
 
 
 # ---------- 主入口 ----------

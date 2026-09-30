@@ -462,27 +462,27 @@ def _short(text, limit=60):
 
 
 def fmt_msg(status, label, server_uuid, detail, renewal=None, days=None):
-    """瘦身版通知: 统计一行 + 该服务器一行（一次只报一台）"""
+    """方案 B (極致精簡人話版): 每台精準兩行，徹底消滅頂部計數器"""
     s = (status or "").strip()
+    name = f"{label}/{short_id(server_uuid)}"
     reason = _short(detail)
     if "成功" in s or s.startswith("✅"):
-        tail = f"剩 {days} 天" if days is not None else (f"续期 {renewal} 天" if renewal is not None else "")
-        tag = "✅ 已續期" + (f" · {tail}" if tail else "")
-        counts = (1, 0, 0)
+        rem_str = f"（剩 {days} 天）" if days is not None else ""
+        l1 = f"✅ {name} · 成功續期{rem_str}"
+        l2 = "ℹ️ 服務已自動展期"
+        return f"{l1}\n{l2}"
     elif "跳过" in s or "已满" in s or s.startswith("⏭️"):
-        tag = "⏭️ 未可續" + (f" · {_short(detail, 44)}" if reason else "")
-        counts = (0, 1, 0)
+        rem_str = f"（剩 {days} 天）" if days is not None else ""
+        l1 = f"🟢 {name} · 狀態良好{rem_str}"
+        info_part = f"{reason} · " if reason else ""
+        l2 = f"ℹ️ {info_part}未到續期窗口"
+        return f"{l1}\n{l2}"
     else:
-        tag = f"❌ {s.strip('❌⚠️ ')}" + (f" · {reason}" if reason else "")
-        counts = (0, 0, 1)
-
-    lines = [
-        f"🎮 Orihost ｜ {now_local()} ｜ ✅ {counts[0]} ｜ ⏭️ {counts[1]} ｜ ❌ {counts[2]}",
-        f"▪️ {label}/{short_id(server_uuid)} · {tag}",
-    ]
-    if counts[2]:
-        lines.append("⚠️ 睇 workflow log 排查")
-    return "\n".join(lines)
+        rem_str = f"（剩 {days} 天）" if days is not None else ""
+        l1 = f"🚨 {name} · 續期未完成{rem_str}"
+        err = reason or s.strip("❌⚠️ ") or "執行失敗"
+        l2 = f"⚠️ {err} · 請登入面板手動處理"
+        return f"{l1}\n{l2}"
 
 
 def main():
