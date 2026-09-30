@@ -450,12 +450,39 @@ def renew_server_loop(s, xsrf: str, server_uuid: str) -> dict:
     return {"status": "❌ 续期失败", "message": last_msg or "未知错误", "renewal": renewal, "days": days}
 
 
+def now_local():
+    """北京时间 (UTC+8)，格式 MM-DD HH:MM（runner 係 UTC）"""
+    return time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
+
+
+def _short(text, limit=60):
+    """压平换行 + 截短"""
+    s = " ".join((text or "").split())
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
 def fmt_msg(status, label, server_uuid, detail, renewal=None, days=None):
-    now = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-    extra = ""
-    if renewal is not None or days is not None:
-        extra = f"\n📊 续期: {renewal} / 剩余 {days} 天"
-    return f"🖥 Orihost 自动续期\n{status}\n👤 {label}\n🆔 {short_id(server_uuid)}{extra}\n📌 {detail}\n⏰ {now}（北京）"
+    """瘦身版通知: 统计一行 + 该服务器一行（一次只报一台）"""
+    s = (status or "").strip()
+    reason = _short(detail)
+    if "成功" in s or s.startswith("✅"):
+        tail = f"剩 {days} 天" if days is not None else (f"续期 {renewal} 天" if renewal is not None else "")
+        tag = "✅ 已續期" + (f" · {tail}" if tail else "")
+        counts = (1, 0, 0)
+    elif "跳过" in s or "已满" in s or s.startswith("⏭️"):
+        tag = "⏭️ 未可續" + (f" · {_short(detail, 44)}" if reason else "")
+        counts = (0, 1, 0)
+    else:
+        tag = f"❌ {s.strip('❌⚠️ ')}" + (f" · {reason}" if reason else "")
+        counts = (0, 0, 1)
+
+    lines = [
+        f"🎮 Orihost ｜ {now_local()} ｜ ✅ {counts[0]} ｜ ⏭️ {counts[1]} ｜ ❌ {counts[2]}",
+        f"▪️ {label}/{short_id(server_uuid)} · {tag}",
+    ]
+    if counts[2]:
+        lines.append("⚠️ 睇 workflow log 排查")
+    return "\n".join(lines)
 
 
 def main():

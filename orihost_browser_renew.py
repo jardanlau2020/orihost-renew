@@ -82,8 +82,20 @@ def send_tg(msg: str):
         print(f"  TG 发送失败: {e}")
 
 
-def now_bj():
-    return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+def now_local():
+    """北京时间 (UTC+8)，格式 MM-DD HH:MM（runner 係 UTC）"""
+    return time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
+
+
+def _short(text, limit=60):
+    """压平换行 + 截短"""
+    s = " ".join((text or "").split())
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def _esc(text):
+    """HTML 转义（本脚本沿用 parse_mode=HTML）"""
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ---------- 账号解析（与 orihost_renew.py 同一套变量名） ----------
@@ -980,8 +992,37 @@ def watchdog_one(sb, server_uuid: str) -> dict:
 
 
 def fmt_msg(status, label, server_uuid, detail):
+    """瘦身版通知: 统计一行 + 该服务器一行（一次只报一台）"""
+    s = (status or "").strip()
     sid = (server_uuid or "").split("-")[0][:8]
-    return f"🖥 Orihost 浏览器续期\n{status}\n👤 {label}\n🆔 {sid}\n📌 {detail}\n⏰ {now_bj()}（北京）"
+    reason = _short(detail)
+    manual = False
+    if "成功" in s:
+        tag = "✅ 已續期" + (f" · {reason}" if reason else "")
+        counts = (1, 0, 0)
+    elif s.startswith("✅"):
+        tag = s + (f" · {reason}" if reason else "")
+        counts = (1, 0, 0)
+    elif s.startswith("⏰"):
+        # 需人手續期：唔算失败（工作流照样绿灯），但一定要提人
+        tag = s + (f" · {reason}" if reason else "")
+        counts = (0, 1, 0)
+        manual = True
+    elif "跳过" in s or s.startswith("⏭️"):
+        tag = "⏭️ 未可續" + (f" · {_short(detail, 44)}" if reason else "")
+        counts = (0, 1, 0)
+    else:
+        tag = f"❌ {s.strip('❌⚠️ ')}" + (f" · {reason}" if reason else "")
+        counts = (0, 0, 1)
+        manual = True
+
+    lines = [
+        f"🎮 Orihost ｜ {now_local()} ｜ ✅ {counts[0]} ｜ ⏭️ {counts[1]} ｜ ❌ {counts[2]}",
+        f"▪️ {_esc(label)}/{_esc(sid)} · {_esc(tag)}",
+    ]
+    if manual:
+        lines.append("⚠️ 睇 workflow log 排查")
+    return "\n".join(lines)
 
 
 # ---------- 主入口 ----------
