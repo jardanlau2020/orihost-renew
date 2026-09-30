@@ -239,6 +239,59 @@ _JS_KILL_AD = """
 })()
 """
 
+# 上游 woshizaiyu 2026-09-29（536d7e7 / 2c76c89）移植：廣告 iframe 按**域名**攔截。
+# 我哋原本嘅 _JS_KILL_AD 只按文案（download is ready）＋高 z-index 掃遮罩，
+# 域名黑名單係另一條互補路：連文案都未 load 到嘅廣告 iframe 一樣清得走。
+# ⚠️ 明確豁免 challenges.cloudflare.com —— 嗰個係 Turnstile 驗證組件，唔可以殺。
+_JS_KILL_AD_IFRAMES = """
+(function () {
+    var bad = ['n6wxm.com', 'nap5k.com', '5gvci.com', 'jhnwr.com',
+               'my.rtmark.net', 'rtmark.net', 'vignette', 'tag.min.js',
+               'doubleclick.net', 'googlesyndication', 'adservice.google'];
+    var out = [], fs = document.querySelectorAll('iframe');
+    for (var i = fs.length - 1; i >= 0; i--) {
+        var src = (fs[i].src || '').toLowerCase();
+        if (src.indexOf('challenges.cloudflare.com') >= 0) continue;
+        for (var j = 0; j < bad.length; j++) {
+            if (src.indexOf(bad[j]) >= 0) { out.push(bad[j]); fs[i].remove(); break; }
+        }
+    }
+    return out.join(',') || 'none';
+})()
+"""
+
+# 上游 2c76c89：廣告關閉按鈕文案係「要關閉」。
+# 收窄到只撳「身處 fixed/absolute 高 z-index 浮層」而且唔喺對話框入面嘅嗰粒，
+# 避免誤撳面板自己嘅 Close。呢個函式**只喺開續期對話框之前**跑（見 kill_page_ads 註釋），
+# 所以就算撞中都唔會撳熄對話框。
+_JS_CLICK_AD_CLOSE = """
+(function () {
+    var want = ['要關閉', '關閉廣告', '关闭广告', '要关闭', '关闭', 'Close', '✕', '×', '✖'];
+    var all = document.querySelectorAll('span,button,a,div');
+    for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        var t = (el.textContent || '').trim();
+        if (want.indexOf(t) < 0) continue;
+        var r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) continue;
+        if (el.closest('[role="dialog"]') || el.closest('[aria-modal="true"]')) continue;
+        var p = el, overlay = false;
+        for (var k = 0; k < 6 && p; k++) {
+            var st = window.getComputedStyle(p);
+            if (st.position === 'fixed' || st.position === 'absolute') {
+                if (parseInt(st.zIndex || '0', 10) >= 100) overlay = true;
+                break;
+            }
+            p = p.parentElement;
+        }
+        if (!overlay) continue;
+        try { el.click(); } catch (e) { continue; }
+        return 'clicked:' + t;
+    }
+    return 'none';
+})()
+"""
+
 _JS_TS_INFO = """
 (function () {
     var inp = document.querySelector('input[name="cf-turnstile-response"]');
@@ -262,6 +315,47 @@ def kill_ad_overlay(sb):
         return sb.execute_script(_JS_KILL_AD)
     except Exception as e:
         return "err:" + str(e)[:60]
+
+
+def kill_page_ads(sb):
+    """页面级清广告（上游 536d7e7 + 2c76c89 移植）。
+
+    同 handle_turnstile 入面嘅 kill_ad_overlay 唔同，呢個係**開續期對話框之前**跑：
+    上游實測廣告 iframe/浮層會蓋住服务器页嘅续期入口，令按鈕搵唔到。
+    返回三段結果字串，方便睇 log。
+    """
+    parts = []
+    for name, js in (("iframe", _JS_KILL_AD_IFRAMES),
+                     ("overlay", _JS_KILL_AD),
+                     ("close", _JS_CLICK_AD_CLOSE)):
+        try:
+            parts.append(f"{name}={sb.execute_script(js)}")
+        except Exception as e:
+            parts.append(f"{name}=err:{str(e)[:40]}")
+    return " ".join(parts)
+
+
+def wait_page_ready(sb, timeout=15):
+    """等页面完全载入再做嘢（上游 218a50f 移植）。
+
+    上游實測：未 load 完就搵按鈕 → 直接誤判「冇 Renew 入口」。
+    先試 SeleniumBase 內建（CDP 模式下佢可能即刻 return，未必真等），
+    唔得再自己輪詢 document.readyState。
+    """
+    try:
+        if sb.wait_for_ready_state_complete(timeout=timeout):
+            return True
+    except Exception as e:
+        print(f"    （內建 readyState 等待失敗，改 JS 輪詢: {str(e)[:60]}）")
+    end = time.time() + max(5, timeout // 2)
+    while time.time() < end:
+        try:
+            if str(sb.execute_script("(function(){return document.readyState})()")) == "complete":
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
 
 
 def ts_info(sb):
@@ -728,6 +822,12 @@ def read_renew_result(sb, sid, days_before=None) -> dict:
         days = info.get("renewal")
         print(f"    API：renewal={days} renewable={info.get('renewable')} status={info.get('status')}")
         if days_before is not None and isinstance(days, (int, float)) and days > days_before:
+            # 上游 e8c5de8 移植：续期成功留一张截图做证据（workflow 照旧 upload *.png）
+            try:
+                sb.save_screenshot(f"renew_success_{sid}.png")
+                print(f"  📸 成功截图: renew_success_{sid}.png")
+            except Exception:
+                pass
             return {"status": "\u2705 续期成功",
                     "message": f"续期天数 {days_before} → {days} 天（+{round(days - days_before)}）"}
         if days_before is not None and days == days_before:
@@ -735,6 +835,11 @@ def read_renew_result(sb, sid, days_before=None) -> dict:
             return {"status": "\u26a0\ufe0f 未知结果",
                     "message": f"Claim 已提交，但天数仍系 {days} 天（未后移），请人工确认"}
     if any(k in src for k in ("renewed successfully", "successfully renewed", "extended")):
+        try:
+            sb.save_screenshot(f"renew_success_{sid}.png")
+            print(f"  📸 成功截图: renew_success_{sid}.png")
+        except Exception:
+            pass
         return {"status": "\u2705 续期成功", "message": "Claim 成功（页面确认）"}
     if err:
         print(f"    API 读取失败: {err}")
@@ -830,6 +935,9 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     # 面板路由用的是 8 位短 ID（如 /server/8651e616），填了完整 UUID 也只取前 8 位
     sb.open(f"{PANEL}/server/{sid}")
     time.sleep(8)
+    # 上游 218a50f：等 readyState 完全載入先搵按鈕（未 load 完就搵 → 誤判冇入口）
+    wait_page_ready(sb)
+    time.sleep(2)
 
     # 先读面板 API 真实状态（最可信）：renewable=False 或 renewal>=18 就係已达上限
     days_before = None
@@ -852,6 +960,8 @@ def renew_one_server(sb, server_uuid: str) -> dict:
 
     # 1. 打开续期对话框：页面级入口按钮文案系「Renew」（停权页系「Renew Server」）
     print("  🔍 找 Renew 入口按钮...")
+    # 上游 536d7e7 / 2c76c89：廣告 iframe / 浮層會蓋住入口，先清一次（唔影響 JS 點擊本身）
+    print("  🧹 清页面广告:", kill_page_ads(sb))
     state = open_renew_dialog(sb, timeout=25)
     if state == "limit":
         return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
@@ -979,6 +1089,8 @@ def watchdog_one(sb, server_uuid: str) -> dict:
     print(f"\n  🖥 [{sid}] 讀續期狀態...")
     sb.open(f"{PANEL}/server/{sid}")
     time.sleep(8)
+    # 上游 218a50f：API 讀數都要等頁面 load 完（唔係會拿到空 shell）
+    wait_page_ready(sb)
     info, err = api_renewal(sb, sid)
     if not info:
         return {"status": "❌ 狀態讀取失敗", "message": f"面板 API 讀唔到（{err}）"}
