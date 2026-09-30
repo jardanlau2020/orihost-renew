@@ -338,24 +338,25 @@ def kill_page_ads(sb):
 def wait_page_ready(sb, timeout=15):
     """等页面完全载入再做嘢（上游 218a50f 移植）。
 
-    上游實測：未 load 完就搵按鈕 → 直接誤判「冇 Renew 入口」。
-    先試 SeleniumBase 內建（CDP 模式下佢可能即刻 return，未必真等），
-    唔得再自己輪詢 document.readyState。
+    ⚠️ 2026-09-30 修正（run 36675590134 / 36675791322 實證）：
+    原本先叫 `sb.wait_for_ready_state_complete()`，之後 `execute_script` 會**靜默返 None**
+    （面板 API 讀唔到（None）→ watchdog 誤報「狀態讀取失敗」＋發紅單 TG）。
+    同一份代碼換返 8f9b382（未加呢個 wait）即恢復 `renewal=14 天`，
+    所以呢度**淨用純 JS 輪詢**，唔再掂 SeleniumBase 嘅 wait API（佢會令 driver 轉 CDP/斷線）。
+    返 True/False 之外，會 print 一句健康檢查，方便下次一眼睇到 driver 有冇斷。
     """
-    try:
-        if sb.wait_for_ready_state_complete(timeout=timeout):
-            return True
-    except Exception as e:
-        print(f"    （內建 readyState 等待失敗，改 JS 輪詢: {str(e)[:60]}）")
-    end = time.time() + max(5, timeout // 2)
+    end = time.time() + max(5, timeout)
+    ok = False
     while time.time() < end:
         try:
             if str(sb.execute_script("(function(){return document.readyState})()")) == "complete":
-                return True
+                ok = True
+                break
         except Exception:
             pass
         time.sleep(1)
-    return False
+    print(f"    （page ready: {ok}, js_health: {js_health(sb)}）")
+    return ok
 
 
 def ts_info(sb):
@@ -727,15 +728,32 @@ def dump_page_debug(sb, sid):
 
 
 def api_renewal(sb, sid):
-    """直接同步读面板 API 嘅 renewal 天数（唔靠页面文字，最可信）"""
-    try:
-        raw = sb.execute_script(_JS_SYNC_GET_SERVER % sid)
-    except Exception as e:
-        return None, "err:" + str(e)[:60]
-    try:
-        return json.loads(raw), None
-    except Exception:
-        return None, str(raw)[:80]
+    """直接同步读面板 API 嘅 renewal 天数（唔靠页面文字，最可信）
+
+    ⚠️ 2026-09-30：`execute_script` 喺 CDP 模式可以**靜默返 None**（唔 throw）。
+    舊碼一撞到就當「讀唔到」→ 發紅單 TG。而家重試 3 次再算失敗，並印健康檢查。
+    """
+    last = None
+    for i in range(3):
+        try:
+            raw = sb.execute_script(_JS_SYNC_GET_SERVER % sid)
+        except Exception as e:
+            last = "err:" + str(e)[:60]
+            raw = None
+        if raw not in (None, "", "null", "ERR null"):
+            try:
+                info = json.loads(raw)
+                if info:
+                    return info, None
+                last = str(raw)[:80]
+            except Exception:
+                last = str(raw)[:80]
+        else:
+            last = "execute_script 返 None（driver 可能轉咗 CDP）"
+            print(f"    ⚠️ 面板 API 第 {i+1} 次讀唔到（{last}），js_health: {js_health(sb)}")
+        if i < 2:
+            time.sleep(2)
+    return None, last
 
 
 _RE_COUNTDOWN = re.compile(r"claim your renewal in[^0-9]{0,140}?(\d{1,4})", re.I)
