@@ -1,10 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Orihost 浏览器自动续期（SeleniumBase + 真浏览器）
+# Orihost 浏览器自动续期（SeleniumBase + 真浏览器）—— 已迁移到 renew-kit
 # 背景：面板 claim 接口强制要求 Cloudflare Turnstile token（GET /api/client/renewal/complete?cf-turnstile-response=xxx），
 #       纯 HTTP 调不通（无 token 直接 500），必须用真浏览器点验证。
 # 流程：Cookie 免登 → 服务器页 → Renew（打开对话框）→ Read Article（新标签读文章）→ 倒计时 → 点 Turnstile → Claim Renewal
 # 参考：katabump-renew-main（同款 Turnstile 处理 + xvfb 无头方案）
+#
+# ─────────────────────────── 迁移说明（renew-kit） ───────────────────────────
+# 公共部分（环境变量读取 / 结果语义 / 报告排版 / TG 通知 / 退出码）交给 renewkit，
+# 本文件只保留 orihost 自己的业务：Turnstile 过盾、Cookie 免登、claim 流程、
+# watchdog 巡检、cron 自我調度。
+#
+# 迁移带来的行为变化（每条都有据，不是顺手改的）：
+#
+# 1. 退出码从 1/0/2 三档收敛成 0/1 两档。原来是
+#      exit 1（没账号 / watchdog 读不到）、exit 2（renew 有失败）、exit 0
+#    workflow 只看「非零」，分不出轻重，也没法把「面板抖了」和「token 废了」区分开。
+#    现在只有 FAILED → 1。
+#
+# 2. TG 从「每台一条」改成「整轮一条」（renew-kit 的 RenewReport 排版）。
+#    原来 3 台服务器就是 3 条消息，同一轮的信息被拆散，看的人得自己拼。
+#
+# 3. watchdog 的「剩 N 天，暂时唔使理」映射成 SKIPPED —— 静默。
+#    这是本仓排程模式的常态（每 3 天巡检一次），天天发就是噪音。
+#    而「⏰ 需人手續期」映射成 UNKNOWN —— **发** TG 但**不**标红：
+#    它是预期内的状态（GHA 过唔到 Turnstile，续期本来就得人手），不是失败。
+#    原来这里 exit 0 但每台一条 TG，方向是对的，现在只是收进统一语义。
+#
+# 4. 状态字符串（"✅ 正常" / "⏰ 需人手續期" / "⏭️ 跳过" / "❌ ..."）保留为
+#    **内部协议**：renew_one_server / watchdog_one 的返回值一个字节没动，
+#    只在报告边界由 _outcome_of() 映射成 Outcome。这样 1300 行浏览器逻辑
+#    不用碰 —— 迁移的风险面就只有这个文件头和 main()。
+#
+# 5. ORIHOST_PROXY 的显式指定优先于工作流代理这一条**保留**：
+#    节点链接（vless:// 之类）只能填 NODE_LINK，本地跑则用 ORIHOST_PROXY。
+#    （上游 setup_proxy.sh 会把 IS_PROXY/PROXY_SERVER 写进 $GITHUB_ENV。）
+#
+# 6. TG_BOT（"chat_id,token" 兼容写法）**取消**。renewkit.notify 只认
+#    TG_BOT_TOKEN / TELEGRAM_TOKEN + TG_CHAT_ID / TELEGRAM_CHAT_ID，四种都读，
+#    少一个就静默跳过通知（不会因为通知挂了把续期判成失败）。
 
 import json
 import os
@@ -12,47 +46,40 @@ import re
 import sys
 import time
 import random
-import requests as tg_lib
+import requests
 from datetime import datetime, timezone, timedelta
 from urllib.parse import unquote
 from seleniumbase import SB
+
+from renewkit import env
+from renewkit.outcome import Outcome
+from renewkit.report import RenewReport, shorten
 
 PANEL = "https://panel.orihost.com"
 # Laravel 默认 remember cookie 名（yanyumm1 实测 Orihost 可用）
 DEFAULT_REMEMBER_NAME = "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d"
 # 文章页停留秒数（面板 dwell=15，多留 buffer；“过早关闭文章页会被警告”）
-ARTICLE_WAIT = int(os.environ.get("ARTICLE_WAIT") or "30")
+ARTICLE_WAIT = env.get_int("ARTICLE_WAIT", 30)
 # Claim 按钮轮询上限
-CLAIM_TIMEOUT = int(os.environ.get("CLAIM_TIMEOUT") or "150")
+CLAIM_TIMEOUT = env.get_int("CLAIM_TIMEOUT", 150)
 
 # ---------- 代理 ----------
 # 优先级：ORIHOST_PROXY 显式指定 > 工作流 sing-box（IS_PROXY/PROXY_SERVER，由 NODE_LINK 转出）
 def _get_proxy():
-    explicit = (os.environ.get("ORIHOST_PROXY") or os.environ.get("ORIHOST_GOST_PROXY") or "").strip()
+    explicit = (env.get("ORIHOST_PROXY") or env.get("ORIHOST_GOST_PROXY") or "").strip()
     if explicit:
         scheme = explicit.split("://", 1)[0].lower() if "://" in explicit else ""
         if scheme in ("http", "https", "socks4", "socks5", "socks5h"):
             return explicit
         print(f"  ⚠️ ORIHOST_PROXY 格式不支持 ({scheme}://)，节点链接请填 NODE_LINK")
-    if os.environ.get("IS_PROXY", "").lower() == "true":
-        srv = (os.environ.get("PROXY_SERVER") or "socks5://127.0.0.1:1080").strip()
+    if (env.get("IS_PROXY") or "").lower() == "true":
+        srv = (env.get("PROXY_SERVER") or "socks5://127.0.0.1:1080").strip()
         print(f"  🔗 使用 sing-box 代理: {srv}")
         return srv
     return ""
 
 PROXY_STR = _get_proxy()
 IS_PROXY = bool(PROXY_STR)
-
-# ---------- Telegram ----------
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""
-if (not TG_BOT_TOKEN or not TG_CHAT_ID) and os.environ.get("TG_BOT"):
-    try:
-        _cid, _tok = os.environ["TG_BOT"].split(",", 1)
-        TG_CHAT_ID = TG_CHAT_ID or _cid.strip()
-        TG_BOT_TOKEN = TG_BOT_TOKEN or _tok.strip()
-    except Exception:
-        pass
 
 
 # ---------- 运行模式 ----------
@@ -61,41 +88,55 @@ if (not TG_BOT_TOKEN or not TG_CHAT_ID) and os.environ.get("TG_BOT"):
 #   （2026-09-23 run 35815226857 / 35819886961 —— 8 轮 8 次全败，两个出口都唔得）。
 #   自动撳续期的边界退到「提醒」，动作留给人手。
 # renew：真撳续期（只有人手 workflow_dispatch 拣 mode=renew 先用）。
-MODE = (os.environ.get("ORIHOST_MODE") or "watchdog").strip().lower()
-WATCH_DAYS = int(os.environ.get("ORIHOST_WATCH_DAYS") or "7")
+MODE = (env.get("ORIHOST_MODE", "watchdog") or "watchdog").strip().lower()
+WATCH_DAYS = env.get_int("ORIHOST_WATCH_DAYS", 7)
 IS_WATCHDOG = MODE != "renew"
 
 
-def send_tg(msg: str):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        return
-    try:
-        r = tg_lib.post(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML",
-                  "link_preview_options": {"is_disabled": True}},
-            timeout=15,
-        )
-        ok = r.status_code == 200 and r.json().get("ok")
-        print(f"  📨 TG {'已发送' if ok else '失败: ' + r.text[:80]}")
-    except Exception as e:
-        print(f"  TG 发送失败: {e}")
+# ---------- 状态字符串 → renew-kit Outcome ----------
+# 上游（renew_one_server / watchdog_one）沿用一串 emoji 状态字，这里做唯一一次映射。
+# 保留那串字是为了不动 1300 行浏览器逻辑；映射集中在这里，改语义只改这一处。
+#
+#   ✅ 正常（watchdog，剩 > WATCH_DAYS） → SKIPPED  静默：排程模式的常态
+#   ⏰ 需人手續期                        → UNKNOWN  发 TG 但**不**标红：
+#                                        GHA 过唔到 Turnstile 是已知前提，不是失败
+#   ⏭️ 跳过（已达上限）                  → ALREADY_MAX
+#   ⏭️ 跳过（冷却中 / 未到窗口）          → SKIPPED
+#   ⚠️ 未知结果                          → UNKNOWN
+#   ✅ 续期成功                          → RENEWED
+#   其余 ❌                             → FAILED（只有它 exit 1）
+_ALREADY_MAX_HINTS = ("已达续期上限", "Renew Limit Reached", "renew limit")
 
 
-def now_local():
-    """北京时间 (UTC+8)，格式 MM-DD HH:MM（runner 係 UTC）"""
-    return time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
+def _outcome_of(status: str, message: str = "") -> Outcome:
+    """把内部状态字映射成 Outcome。纯函数，方便离线把每种字都过一遍。"""
+    s = (status or "").strip()
+    blob = f"{s} {message or ''}"
+    if "成功" in s:
+        return Outcome.RENEWED
+    if s.startswith("⏰"):
+        return Outcome.UNKNOWN
+    if s.startswith("⏭️") or "跳过" in s:
+        return (Outcome.ALREADY_MAX
+                if any(h.lower() in blob.lower() for h in _ALREADY_MAX_HINTS)
+                else Outcome.SKIPPED)
+    if s.startswith("⚠️"):
+        return Outcome.UNKNOWN
+    if s.startswith("✅"):
+        return Outcome.SKIPPED
+    return Outcome.FAILED
 
 
-def _short(text, limit=60):
-    """压平换行 + 截短"""
-    s = " ".join((text or "").split())
-    return s if len(s) <= limit else s[:limit - 1] + "…"
+def _detail_of(status: str, message: str) -> str:
+    """给报告用的细节行。
 
-
-def _esc(text):
-    """HTML 转义（本脚本沿用 parse_mode=HTML）"""
-    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    状态字本身（"❌ 续期失败"）对已经看过 TG 的人是零信息量 —— 真正有用的是
+    后面那句 message（"Turnstile 验证 6 次未通过"）。所以优先用 message。
+    """
+    msg = shorten(message, 90)
+    if msg:
+        return msg
+    return shorten(status.strip("✅❌⚠️⏭️⏰ "), 90) or "执行失败"
 
 
 # ---------- 账号解析（与 orihost_renew.py 同一套变量名） ----------
@@ -129,10 +170,16 @@ def parse_auth_cookies(auth_raw: str):
 
 
 def load_accounts():
+    """账号来源（变量名与 orihost_renew.py 保持一致）。
+
+    变量名是拼出来的（ORIHOST_REMEMBER_1..19），所以这里用 env.get 而不是
+    os.environ —— env.get 顺带做了 strip，用户从浏览器复制 token 时尾巴上
+    那个换行/空格是最高频的坑（README 专门提醒过）。
+    """
     accounts = []
     for i in range(1, 20):
-        token_raw = (os.environ.get(f"ORIHOST_REMEMBER_{i}") or os.environ.get(f"ORIHOST_COOKIE_{i}") or "").strip()
-        ids = _split_ids(os.environ.get(f"ORIHOST_SERVER_IDS_{i}") or "")
+        token_raw = (env.get(f"ORIHOST_REMEMBER_{i}") or env.get(f"ORIHOST_COOKIE_{i}") or "").strip()
+        ids = _split_ids(env.get(f"ORIHOST_SERVER_IDS_{i}"))
         if not token_raw and not ids:
             continue
         if not token_raw or not ids:
@@ -140,8 +187,9 @@ def load_accounts():
             continue
         accounts.append({"label": f"账号{i}", "auth": token_raw, "servers": ids})
     if not accounts:
-        single_auth = (os.environ.get("ORIHOST_REMEMBER") or os.environ.get("ORI_COOKIE") or os.environ.get("ORIHOST_COOKIE") or "").strip()
-        single_ids = _split_ids(os.environ.get("ORIHOST_SERVER_IDS") or os.environ.get("ORIHOST_SERVER_IDS_1") or "")
+        single_auth = (env.get("ORIHOST_REMEMBER") or env.get("ORI_COOKIE")
+                       or env.get("ORIHOST_COOKIE") or "").strip()
+        single_ids = _split_ids(env.get("ORIHOST_SERVER_IDS") or env.get("ORIHOST_SERVER_IDS_1"))
         if single_auth and single_ids:
             accounts.append({"label": "默认账号", "auth": single_auth, "servers": single_ids})
     return accounts
@@ -896,8 +944,8 @@ def save_rotated_cookies(sb):
     """免登成功后，把浏览器内最新 remember_web cookie 写回 GitHub secret（防一次性轮换）。"""
     try:
         import os, base64
-        gt = os.environ.get("GH_ROTATE_TOKEN") or os.environ.get("GITHUB_TOKEN")
-        repo = os.environ.get("GITHUB_REPOSITORY")  # jardanlau2020/orihost-renew
+        gt = env.get("GH_ROTATE_TOKEN") or env.get("GITHUB_TOKEN")
+        repo = env.get("GITHUB_REPOSITORY")  # jardanlau2020/orihost-renew
         if not gt or not repo or "/" not in repo:
             return  # 本地跑冇環境，靜默跳過
         val = None
@@ -1127,43 +1175,6 @@ def watchdog_one(sb, server_uuid: str) -> dict:
     return {"status": "✅ 正常", "days": d, "message": f"剩 {d} 天（>{WATCH_DAYS} 天，暫唔使理）"}
 
 
-def fmt_msg(status, label, server_uuid, detail):
-    """方案 B (極致精簡人話版): 每台精準兩行，徹底消滅頂部計數器"""
-    s = (status or "").strip()
-    sid = (server_uuid or "").split("-")[0][:8]
-    name = f"{label}/{sid}"
-    reason = _short(detail)
-    m = re.search(r"剩\s*(\d+)\s*天", detail or "")
-    rem_days = f"（剩 {m.group(1)} 天）" if m else ""
-
-    if "成功" in s:
-        l1 = f"✅ {name} · 成功續期{rem_days}"
-        l2 = "ℹ️ 服務已自動展期"
-        return f"{_esc(l1)}\n{_esc(l2)}"
-    elif s.startswith("✅"):
-        # 正常狀態
-        l1 = f"🟢 {name} · 狀態良好{rem_days}"
-        info_part = f"{reason} · " if reason else ""
-        l2 = f"ℹ️ {info_part}未到續期窗口"
-        return f"{_esc(l1)}\n{_esc(l2)}"
-    elif s.startswith("⏰"):
-        # 需人手續期
-        l1 = f"🚨 {name} · 續期未完成{rem_days}"
-        note = reason or "需人手續期"
-        l2 = f"⚠️ {note} · 請登入面板手動處理"
-        return f"{_esc(l1)}\n{_esc(l2)}"
-    elif "跳过" in s or s.startswith("⏭️"):
-        l1 = f"🟢 {name} · 狀態良好{rem_days}"
-        info_part = f"{reason} · " if reason else ""
-        l2 = f"ℹ️ {info_part}未到續期窗口"
-        return f"{_esc(l1)}\n{_esc(l2)}"
-    else:
-        l1 = f"🚨 {name} · 續期未完成{rem_days}"
-        err = reason or s.strip("❌⚠️ ") or "執行失敗"
-        l2 = f"⚠️ {err} · 請登入面板手動處理"
-        return f"{_esc(l1)}\n{_esc(l2)}"
-
-
 # ---------- cron 自我調度（移植自上游 orihost_browser_renew.py / oyz FreezeHost） ----------
 # 上游原版只服務 renew：續期成功後把 cron **改寫成**「到期前一天」嘅一次性定時。
 # 但本 fork 嘅 cron 係 `0 10 */3 * *`（每 3 日 watchdog 巡檢），直接改寫會令兜底
@@ -1223,17 +1234,17 @@ def updateCronSchedule(expires_at, lead_days: int = 1) -> bool:
     回寫走 **Contents API** 而唔係 `git push`：上游靠 checkout 嘅 extraheader +
     GIT_ASKPASS，喺 fork 上容易因權限靜默失敗；API 直接帶 token，成敗一目了然。
     """
-    if os.environ.get("DRY_RUN", "").lower() == "true":
+    if env.dry_run():
         print("  ℹ️ DRY_RUN 演練，跳過 cron 回寫")
         return False
-    if os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
+    if (env.get("GITHUB_ACTIONS") or "").lower() != "true":
         print("  ℹ️ 非 CI 環境，跳過 cron 回寫")
         return False
-    repo = (os.environ.get("GITHUB_REPOSITORY") or "").strip()
+    repo = env.get("GITHUB_REPOSITORY")
     if "/" not in repo:
         print("  ℹ️ 無 GITHUB_REPOSITORY，跳過 cron 回寫")
         return False
-    token = (os.environ.get("GH_ROTATE_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    token = env.get("GH_ROTATE_TOKEN") or env.get("GH_TOKEN")
     if not token:
         print("  ℹ️ 未提供 GH_ROTATE_TOKEN / GH_TOKEN，跳過 cron 回寫")
         return False
@@ -1296,8 +1307,8 @@ def updateCronSchedule(expires_at, lead_days: int = 1) -> bool:
         hdr = {"Authorization": f"Bearer {token}",
                "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": "2022-11-28"}
-        branch = os.environ.get("GITHUB_REF_NAME") or "main"
-        r = tg_lib.get(f"{api}?ref={branch}", headers=hdr, timeout=20)
+        branch = env.get("GITHUB_REF_NAME") or "main"
+        r = requests.get(f"{api}?ref={branch}", headers=hdr, timeout=20)
         if r.status_code != 200:
             print(f"  ⚠️ 讀 workflow 失敗 HTTP {r.status_code}: {r.text[:120]}")
             return False
@@ -1310,7 +1321,7 @@ def updateCronSchedule(expires_at, lead_days: int = 1) -> bool:
         }
         if sha:
             body["sha"] = sha
-        r2 = tg_lib.put(api, headers=hdr, json=body, timeout=20)
+        r2 = requests.put(api, headers=hdr, json=body, timeout=20)
         if r2.status_code in (200, 201):
             print(f"  ✅ cron 已回寫: {new_line.strip()}")
             return True
@@ -1322,15 +1333,29 @@ def updateCronSchedule(expires_at, lead_days: int = 1) -> bool:
 
 
 # ---------- 主入口 ----------
-def main():
-    print("#" * 42)
-    print("   Orihost 浏览器自动续期" + ("（代理开）" if IS_PROXY else "（直连）"))
-    print(f"   模式 MODE={MODE}" + ("（watchdog：只讀狀態 + 到期提醒，唔撳續期）" if IS_WATCHDOG else "（renew：真撳續期）"))
-    print("#" * 42)
+SERVICE = "Orihost"
+
+#: 静默的结果：本仓排程是「每 3 天一次巡检」，「剩 N 天，暂唔使理」是常态，
+#: 每次都发 TG 就是噪音。需要人知道的（RENEWED / ALREADY_MAX / UNKNOWN / FAILED）
+#: 才打扰人 —— 注意 UNKNOWN 也在打扰之列：watchdog 的「⏰ 需人手續期」就映射成它，
+#: 而那条**必须**发出去（GHA 过唔到 Turnstile，续期本来就得人手）。
+QUIET_OUTCOMES = frozenset({Outcome.SKIPPED, Outcome.TRANSIENT})
+
+
+def _target_name(label: str, server_uuid: str) -> str:
+    """报告里的目标名：账号标签 + 短 ID（面板地址栏 /server/ 后面那 8 位）。"""
+    sid = (server_uuid or "").split("-")[0][:8]
+    return f"{label}/{sid}"
+
+
+def run_all() -> RenewReport:
+    """跑完所有账号的所有服务器，返回报告。不做任何 exit、不发 TG。"""
+    report = RenewReport(service=SERVICE)
     accounts = load_accounts()
     if not accounts:
-        print("❌ 未配置账号。请设置 ORIHOST_REMEMBER + ORIHOST_SERVER_IDS ...")
-        sys.exit(1)
+        report.add(SERVICE, Outcome.FAILED,
+                   detail="未配置账号（需要 ORIHOST_REMEMBER + ORIHOST_SERVER_IDS）")
+        return report
 
     sb_kwargs = {"uc": True, "headless": False,
                  "chromium_arg": "--disable-popup-blocking,--disable-notifications"}
@@ -1340,7 +1365,6 @@ def main():
     else:
         print("🌐 未使用代理，直连访问")
 
-    results = []
     print("🚀 启动浏览器...")
     with SB(**sb_kwargs) as sb:
         try:
@@ -1352,35 +1376,52 @@ def main():
             label = acc["label"]
             print(f"\n{'=' * 42}\n {label}：{len(acc['servers'])} 台\n{'=' * 42}")
             if not cookie_login(sb, acc["auth"]):
-                for sv in acc["servers"]:
-                    info = {"label": label, "server": sv, "status": "❌ 登录失败", "message": "Cookie 免登失败，remember 可能失效"}
-                    results.append(info)
-                    send_tg(fmt_msg(info["status"], label, sv, info["message"]))
+                # remember token 废了 —— 这是**账号级**失败，不是服务器级的。
+                # 原来每台各报一条 TG（3 台就是 3 条一样的「登录失败」），
+                # 现在收成一条，把受影响的台数写在目标名里。
+                report.add(f"{label}（{len(acc['servers'])} 台）", Outcome.FAILED,
+                           detail="Cookie 免登失败，remember token 可能已失效")
                 continue
             for sv in acc["servers"]:
                 try:
                     r = watchdog_one(sb, sv) if IS_WATCHDOG else renew_one_server(sb, sv)
                 except Exception as e:
                     r = {"status": "❌ 状态读取失败" if IS_WATCHDOG else "❌ 续期失败",
-                         "message": f"异常: {str(e)[:120]}"}
-                info = {"label": label, "server": sv, "status": r["status"],
-                        "message": r.get("message", ""), "days": r.get("days")}
-                results.append(info)
-                print(f"  {info['status']} {info['message']}")
-                # watchdog 模式：正常就靜默（唔想日日嘈），只有「到期要人手」或「讀唔到」先出 TG
-                should_tg = True
-                if IS_WATCHDOG and info["status"].startswith("✅"):
-                    should_tg = False
-                if should_tg:
-                    send_tg(fmt_msg(info["status"], label, sv, info["message"]))
+                         "message": f"异常: {type(e).__name__}: {str(e)[:110]}"}
+                status = r.get("status", "")
+                message = r.get("message", "")
+                report.add(_target_name(label, sv), _outcome_of(status, message),
+                           expire=r.get("days"), detail=_detail_of(status, message))
+                print(f"  {status} {message}")
                 time.sleep(random.randint(2, 5))
+    return report
+
+
+def main() -> int:
+    print("#" * 42)
+    print("   Orihost 浏览器自动续期" + ("（代理开）" if IS_PROXY else "（直连）"))
+    print(f"   模式 MODE={MODE}"
+          + ("（watchdog：只讀狀態 + 到期提醒，唔撳續期）" if IS_WATCHDOG else "（renew：真撳續期）"))
+    print("#" * 42)
+
+    try:
+        report = run_all()
+    except Exception as exc:
+        # 浏览器/驱动起不来之类。不能让 traceback 直接甩给 workflow ——
+        # 甩出去 action 只看到 "Process completed with exit code 1"，
+        # 连是哪一步挂的都看不出来。
+        report = RenewReport(service=SERVICE)
+        report.add(SERVICE, Outcome.FAILED,
+                   detail=f"{type(exc).__name__}: {shorten(str(exc), 140)}")
 
     # ---------- cron 自我調度（按到期日排下一次巡檢） ----------
     # 攞全部 server 中剩餘天數最少嘅一台算窗口：
     #   watchdog：窗口 = 到期前 WATCH_DAYS 日（即 days 啱啱跌到閾值嗰日）→ 提醒貼住臨界點
     #   renew   ：窗口 = 到期前 1 日（同上游一致）
     # 只喺「表達式真係變咗」先提交，所以穩定嘅到期日下唔會刷 commit。
-    days_list = [r["days"] for r in results if isinstance(r.get("days"), (int, float))]
+    # 注意：天數讀數現在存在 TargetResult.expire 上（int = 剩餘天數），
+    # 所以這裡要從 report.results 取，而不是原來的裸 dict list。
+    days_list = [r.expire for r in report.results if isinstance(r.expire, (int, float))]
     if days_list:
         min_days = min(days_list)
         lead = WATCH_DAYS if IS_WATCHDOG else 1
@@ -1391,20 +1432,24 @@ def main():
         print("\n⏱ 自我調度：本輪無有效天數讀數，跳過")
 
     if IS_WATCHDOG:
-        bad = sum(1 for r in results if r["status"].startswith("❌"))
-        warn = sum(1 for r in results if r["status"].startswith("⏰"))
-        print(f"\n{'=' * 42}\n📊 watchdog 汇总：{len(results)} 台｜{warn} 台需人手續期｜{bad} 台讀唔到\n{'=' * 42}")
-        # 讀唔到狀態才當真失敗（exit 1）；「需人手」係預期狀態，唔應該標紅
-        if bad:
-            sys.exit(1)
-        sys.exit(0)
-    ok = sum(1 for r in results if "成功" in r["status"])
-    skip = sum(1 for r in results if "跳过" in r["status"])
-    fail = len(results) - ok - skip
-    print(f"\n{'=' * 42}\n📊 汇总：{ok} 成功 / {skip} 跳过 / {fail} 失败，共 {len(results)} 台\n{'=' * 42}")
-    if fail:
-        sys.exit(2)
+        warn = sum(1 for r in report.results if r.outcome is Outcome.UNKNOWN)
+        bad = sum(1 for r in report.results if r.outcome is Outcome.FAILED)
+        print(f"\n{'=' * 42}\n📊 watchdog 汇总：{len(report.results)} 台｜{warn} 台需人手續期｜"
+              f"{bad} 台讀唔到\n{'=' * 42}")
+    else:
+        c = report.counts()
+        done = c.get("renewed", 0)
+        skip = c.get("skipped", 0) + c.get("already_max", 0)
+        print(f"\n{'=' * 42}\n📊 汇总：{done} 成功 / {skip} 跳过 / {c.get('failed', 0)} 失败，"
+              f"共 {len(report.results)} 台\n{'=' * 42}")
+
+    # 退出码收敛成两档（renew-kit 的 RenewReport.finish）：
+    #   0 = 正常（含 SKIPPED / ALREADY_MAX / UNKNOWN / TRANSIENT）
+    #   1 = 真失败，需要人
+    # 原来是 1/0/2 三档散落在各处，workflow 只看「非零」，分不出轻重。
+    notify_tg = any(r.outcome not in QUIET_OUTCOMES for r in report.results)
+    return report.finish(notify_tg=notify_tg)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

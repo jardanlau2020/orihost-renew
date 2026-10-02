@@ -1,11 +1,24 @@
 name: Orihost Auto Renew
 
+# Orihost 续期主流程。业务逻辑在 orihost_browser_renew.py；Python/依赖/代理/
+# 通知/退出码这些通用部分走 renew-kit 的 composite action，不再手写。
+#
+# 排程语义（2026-09-25 起，本仓的核心约束）：
+#   claim 接口强制 Cloudflare Turnstile（GET /api/client/renewal/complete?
+#   cf-turnstile-response=xxx），GHA runner IP 实测 8 轮 8 次全败
+#   （run 35815226857 / 35819886961），挂代理亦唔得 → **自动续期刻意关闭**。
+#   排程只做 watchdog：读面板剩余天数，剩 ≤ORIHOST_WATCH_DAYS 天发 TG 提醒。
+#   真撳续期只留人手 workflow_dispatch（mode=renew），预期红属正常。
+#
+# 定时表达式会被脚本自我調度改写：main() 末尾按「最紧急那台的到期日」调
+# updateCronSchedule()，把一条带 # renewkit:auto 标记的 cron 行追加/替换到
+# 下面 schedule 列表的最后一条 cron 之后（见 _CRON_LINE_RE / _AUTO_LINE_RE）。
+# 所以下面那条 `- cron: '0 10 */3 * *'` 是**基准巡检**，必须留着当锚点 ——
+# 删了的话脚本找不到插入点，会直接放弃 cron 回写（日志打 ⚠️，不影响续期）。
+
 on:
   schedule:
     # 每 3 天一次，UTC 10:00 = 北京时间 18:00（7 天有效期，提前续避免删机）
-    # 2026-09-25 起：排程只做 watchdog —— 讀面板 API 剩餘天數，剩 ≤7 天出 TG 提醒。
-    #   唔再自動撳續期：claim 接口強制 Cloudflare Turnstile，GHA runner IP 實測
-    #   8 輪 8 次全敗（run 35815226857 / 35819886961），加代理都無用 → 屬人手步驟。
     - cron: '0 10 */3 * *'
   workflow_dispatch:
     inputs:
@@ -17,38 +30,60 @@ on:
         options:
           - watchdog
           - renew
+      dry_run:
+        description: 'Dry run（只檢查、唔回寫 cron、唔真撳續期）'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
 
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 浏览器 + 过盾 + 多账号巡检；apt 装 xvfb/xdotool/scrot 与 pip 装
+    # seleniumbase 都不便宜，25 分钟对多账号偏紧，放到 30。
+    timeout-minutes: 30
+    concurrency:
+      group: orihost-renew
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
 
-      - name: Setup Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.11'
-
-      - name: Install system dependencies (xvfb for headed browser)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb xdotool scrot
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: ⚙ 设置代理 (sing-box)
+      # 出口 IP 只做记录。面板前面有 Cloudflare，真出问题时第一件事就是看
+      # 出口换没换（watchdog 亦要过 CF 才读得到天数）。
+      - name: 📍 确认出口 IP
         continue-on-error: true
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+          echo "Runner 出口 IP: $(curl -s --max-time 15 https://api.ipify.org || echo n/a)"
 
-      - name: Run Orihost（watchdog 讀狀態 / renew 真續期）
+      - name: 🔄 执行续期（renew-kit）
+        uses: jardanlau2020/renew-kit/.github/actions/renew@v0.4.2
+        with:
+          script: orihost_browser_renew.py
+          python-version: "3.11"
+          # 钉版本号而不是 @main：main 上出过一次 composite action 的语法错，
+          # 所有 @main 的仓库一起变红。升级是显式动作，改这里两个 v0.4.2 即可。
+          renewkit-ref: v0.4.2
+          apt-packages: "xvfb xdotool scrot"
+          # requirements.txt 里已有 seleniumbase/requests/curl_cffi，action 会
+          # 自动装；pynacl 是 cron 回写那条路（GH 签名）用的，单独补。
+          pip-packages: "pynacl"
+          # 代理是「尽力而为」：装不成或探不通都退回直连，所以保持默认的
+          # continue-on-error=true，绝不因为代理挂了而中断续期。
+          # ⚠️ 但直连对面板不友好 —— Cloudflare 对 runner 机房 IP 更凶，
+          # watchdog 读天数都可能过唔到。NODE_LINK 必须传到（见下面 env）。
+          setup-command: "bash scripts/setup_proxy.sh"
+          # SeleniumBase 的 UC 模式要真实 X 显示才能发系统级点击（过 CF 盾），
+          # 所以主命令得套 xvfb-run，不能用默认的 python <script>。
+          command: 'xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 orihost_browser_renew.py'
+          artifact-paths: "*.png"
+          artifact-name: orihost-shots
+          notify-on-failure: "true"
         env:
           # 默認 watchdog；只有人手 dispatch 揀 mode=renew 先會真撳續期
-          ORIHOST_MODE: ${{ github.event.inputs.mode || 'watchdog' }}
+          ORIHOST_MODE: ${{ inputs.mode || 'watchdog' }}
           ORIHOST_WATCH_DAYS: '7'
           ORIHOST_REMEMBER: ${{ secrets.ORIHOST_REMEMBER }}
           ORIHOST_SERVER_IDS: ${{ secrets.ORIHOST_SERVER_IDS }}
@@ -58,24 +93,15 @@ jobs:
           ORIHOST_SERVER_IDS_2: ${{ secrets.ORIHOST_SERVER_IDS_2 }}
           ORIHOST_REMEMBER_3: ${{ secrets.ORIHOST_REMEMBER_3 }}
           ORIHOST_SERVER_IDS_3: ${{ secrets.ORIHOST_SERVER_IDS_3 }}
+          # renewkit.notify 读的就是这两个名字（TELEGRAM_* 亦可）
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           ORIHOST_PROXY: ${{ secrets.ORIHOST_PROXY }}
+          # cron 自我調度回写 workflow 用的 PAT（Contents API，要 contents:write）
           GH_ROTATE_TOKEN: ${{ secrets.GH_ROTATE_TOKEN }}
-          RENEWAL_MAX: '21'
-          MAX_ATTEMPTS: '5'
-        run: |
-          # setup_proxy.sh 已將 IS_PROXY/PROXY_SERVER 寫入 GITHUB_ENV（呢個 step 讀得到）
-          echo "IS_PROXY=$IS_PROXY | PROXY_SERVER=$PROXY_SERVER"
-          pip install pynacl 2>&1 | tail -1
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
-            python orihost_browser_renew.py
-
-      - name: Upload screenshots
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: orihost-shots-${{ github.run_id }}
-          path: |
-            *.png
-          if-no-files-found: ignore
+          # ⚠️ NODE_LINK 必须传给 setup_proxy.sh，否则上游 installer 的
+          # `export NODE_LINK=${NODE_LINK:-''}` 取到空值，直接走「未配置代理，
+          # 直连模式」，一声不响地退回 runner 机房 IP —— 面板 WAF 对机房 IP
+          # 是默认拒绝的。setup_proxy.sh 里加了空值告警兜底。
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
