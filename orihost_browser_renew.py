@@ -847,10 +847,12 @@ def read_renew_result(sb, sid, days_before=None) -> dict:
             except Exception:
                 pass
             return {"status": "\u2705 续期成功",
+                    "days": days,
                     "message": f"续期天数 {days_before} → {days} 天（+{round(days - days_before)}）"}
         if days_before is not None and days == days_before:
             sb.save_screenshot(f"claim_noadvance_{sid}.png")
             return {"status": "\u26a0\ufe0f 未知结果",
+                    "days": days,
                     "message": f"Claim 已提交，但天数仍系 {days} 天（未后移），请人工确认"}
     if any(k in src for k in ("renewed successfully", "successfully renewed", "extended")):
         try:
@@ -966,6 +968,7 @@ def renew_one_server(sb, server_uuid: str) -> dict:
         d = days_before
         if info.get("renewable") is False or (isinstance(d, (int, float)) and d >= 18):
             return {"status": "\u23ed\ufe0f 跳过",
+                    "days": d,
                     "message": f"已达续期上限（API: renewal={d} 天 renewable={info.get('renewable')}）"}
     elif err:
         print(f"  ⚠️ 读续期天数失败: {err}")
@@ -1001,7 +1004,9 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     now_res = click_by_text(sb, "renew now", timeout=5)
     if str(now_res).startswith("clicked"):
         print(f"  ⚡ ad-free 帐号：对话框里直接 Renew Now（{now_res}）")
-        return read_renew_result(sb, sid)
+        # days_before 一定要传：唔传嘅话 read_renew_result 里「续期后 > 续期前」嘅
+        # API 增量对比会失效，只能退回模糊嘅页面文字判断（易误判成功）。
+        return read_renew_result(sb, sid, days_before)
 
     # 2. 装 window.open 垫片 → 点 Read Article
     #    面板靠 window.open('about:blank') 开文章页；JS 合成 click 冇 user activation，
@@ -1115,10 +1120,11 @@ def watchdog_one(sb, server_uuid: str) -> dict:
     d = info.get("renewal")
     ren = info.get("renewable")
     print(f"  📊 renewal={d} 天 renewable={ren} status={info.get('status')}")
+    # days 一齊帶返去，main() 用它算 cron 自我調度（見 updateCronSchedule）
     if isinstance(d, (int, float)) and d <= WATCH_DAYS:
-        return {"status": "⏰ 需人手續期",
+        return {"status": "⏰ 需人手續期", "days": d,
                 "message": f"剩 {d} 天（renewable={ren}）→ 去 panel 人手撳 Renew（GHA 過唔到 Turnstile）"}
-    return {"status": "✅ 正常", "message": f"剩 {d} 天（>{WATCH_DAYS} 天，暫唔使理）"}
+    return {"status": "✅ 正常", "days": d, "message": f"剩 {d} 天（>{WATCH_DAYS} 天，暫唔使理）"}
 
 
 def fmt_msg(status, label, server_uuid, detail):
@@ -1156,6 +1162,163 @@ def fmt_msg(status, label, server_uuid, detail):
         err = reason or s.strip("❌⚠️ ") or "執行失敗"
         l2 = f"⚠️ {err} · 請登入面板手動處理"
         return f"{_esc(l1)}\n{_esc(l2)}"
+
+
+# ---------- cron 自我調度（移植自上游 orihost_browser_renew.py / oyz FreezeHost） ----------
+# 上游原版只服務 renew：續期成功後把 cron **改寫成**「到期前一天」嘅一次性定時。
+# 但本 fork 嘅 cron 係 `0 10 */3 * *`（每 3 日 watchdog 巡檢），直接改寫會令兜底
+# 巡檢停擺 —— 一旦算錯日期就靜默死掉，而且再冇任何 run 去修正它。
+#
+# 所以呢度改成**追加一條、冪等替換**：原有 schedule 一行不動，另外 append 一條
+# 帶 `# auto:` 標記嘅窗口定時；下次再調度時只覆蓋帶標記嗰條。
+#   on:
+#     schedule:
+#       - cron: '0 10 */3 * *'                      # 基準：永遠保留
+#       - cron: '0 10 15 10 *'  # auto: renew-window=2026-10-15T10:00Z lead=1
+#
+# 點解唔用「併入 day-of-month」寫法（`0 10 1,4,...,31,15 * *`）：
+# 每次 run 都往列表塞一日，跑一個月就會退化成「每日」，基準節奏被自己嘅輸出污染。
+# 追加式冇呢個問題：基準線永不可變，auto 行永遠最多一條。
+
+_AUTO_TAG = "# auto: renew-window="
+# 只匹配「帶 auto 標記嘅 schedule 行」（連行尾換行），用嚟做冪等替換
+_AUTO_LINE_RE = re.compile(
+    r"^[ \t]*-[ \t]*cron:[ \t]*(?P<q>['\"])(?P<cron>[^'\"]*)(?P=q)[^\n]*"
+    + re.escape(_AUTO_TAG) + r"[^\n]*\n?",
+    re.M,
+)
+# 最後一條普通 schedule cron 行（append 位置）
+_CRON_LINE_RE = re.compile(
+    r"^[ \t]*-[ \t]*cron:[ \t]*(['\"])[^'\"]*\1[^\n]*$", re.M
+)
+
+
+def _workflow_path():
+    for name in ("renew.yml", "renew-browser.yml"):
+        p = os.path.join(os.getcwd(), ".github", "workflows", name)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _cron_expr(next_run) -> str:
+    """窗口定時表達式：帶月/日（唔用 *），避免殘留行每月誤觸。"""
+    return f"0 10 {next_run.day} {next_run.month} *"
+
+
+def _build_auto_line(next_run, lead_days: int) -> str:
+    """生成 auto schedule 行（含機器可讀標記，供下次冪等替換）。"""
+    return (
+        f"    - cron: '{_cron_expr(next_run)}'"
+        f"  {_AUTO_TAG}{next_run.strftime('%Y-%m-%dT%H:%MZ')} lead={lead_days}"
+    )
+
+
+def updateCronSchedule(expires_at, lead_days: int = 1) -> bool:
+    """按到期時間追加/更新一條 auto cron，令下次巡檢落在「到期前 lead_days 日」。
+
+    expires_at：ISO 8601 字串（可帶 Z）或 datetime。
+    lead_days：renew 模式傳 1（同上游一致）；watchdog 模式傳 WATCH_DAYS。
+
+    回寫走 **Contents API** 而唔係 `git push`：上游靠 checkout 嘅 extraheader +
+    GIT_ASKPASS，喺 fork 上容易因權限靜默失敗；API 直接帶 token，成敗一目了然。
+    """
+    if os.environ.get("DRY_RUN", "").lower() == "true":
+        print("  ℹ️ DRY_RUN 演練，跳過 cron 回寫")
+        return False
+    if os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
+        print("  ℹ️ 非 CI 環境，跳過 cron 回寫")
+        return False
+    repo = (os.environ.get("GITHUB_REPOSITORY") or "").strip()
+    if "/" not in repo:
+        print("  ℹ️ 無 GITHUB_REPOSITORY，跳過 cron 回寫")
+        return False
+    token = (os.environ.get("GH_ROTATE_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    if not token:
+        print("  ℹ️ 未提供 GH_ROTATE_TOKEN / GH_TOKEN，跳過 cron 回寫")
+        return False
+
+    wf = _workflow_path()
+    if not wf:
+        print("  ⚠️ 未找到 workflow 檔案，跳過 cron 回寫")
+        return False
+
+    try:
+        # ---- 算目標日（到期前 lead_days 日）----
+        if isinstance(expires_at, datetime):
+            t = expires_at
+        else:
+            t = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+
+        def _snap(dt_):
+            # 對齊基準 cron 嘅 10:00 UTC。唔對齊嘅話每次 run 算出來嘅分秒都唔同
+            # → auto 行次次都變 → 每跑一次就多一個 commit（repo 會被自己刷爆）。
+            return dt_.astimezone(timezone.utc).replace(
+                hour=10, minute=0, second=0, microsecond=0)
+
+        next_run = _snap(t - timedelta(days=max(0, int(lead_days))))
+        if next_run <= datetime.now(timezone.utc):
+            # 窗口已過（例如天數讀數偏差），退回「明日 10:00」跑一次確認
+            next_run = _snap(datetime.now(timezone.utc) + timedelta(hours=12))
+
+        new_line = _build_auto_line(next_run, max(0, int(lead_days)))
+
+        with open(wf, "r", encoding="utf-8") as f:
+            old = f.read()
+
+        # ---- 冪等替換：有 auto 行就換掉，冇就 append 喺最後一條 cron 之後 ----
+        prev = _AUTO_LINE_RE.search(old)
+        if prev:
+            # 只比 cron 表達式，唔比註釋裡嘅時間戳：表達式一樣就當無事發生，
+            # 避免「同一日、只係秒數唔同」都觸發一次提交。
+            if prev.group("cron") == _cron_expr(next_run):
+                print(f"  ℹ️ auto cron 無需變更（{prev.group('cron')}）")
+                return False
+            updated = old[:prev.start()] + new_line + "\n" + old[prev.end():]
+        else:
+            last = None
+            for last in _CRON_LINE_RE.finditer(old):
+                pass
+            if last is None:
+                print("  ⚠️ workflow 無 cron 行，跳過 cron 回寫")
+                return False
+            insert_at = last.end()
+            updated = old[:insert_at] + "\n" + new_line + old[insert_at:]
+
+        if updated == old:
+            print("  ℹ️ cron 無需變更")
+            return False
+
+        # ---- Contents API 回寫 ----
+        api = f"https://api.github.com/repos/{repo}/contents/.github/workflows/{os.path.basename(wf)}"
+        hdr = {"Authorization": f"Bearer {token}",
+               "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28"}
+        branch = os.environ.get("GITHUB_REF_NAME") or "main"
+        r = tg_lib.get(f"{api}?ref={branch}", headers=hdr, timeout=20)
+        if r.status_code != 200:
+            print(f"  ⚠️ 讀 workflow 失敗 HTTP {r.status_code}: {r.text[:120]}")
+            return False
+        sha = r.json().get("sha")
+        import base64 as _b64
+        body = {
+            "message": f"chore(cron): 下次巡檢 {next_run.strftime('%Y-%m-%d %H:%M UTC')}",
+            "content": _b64.b64encode(updated.encode("utf-8")).decode(),
+            "branch": branch,
+        }
+        if sha:
+            body["sha"] = sha
+        r2 = tg_lib.put(api, headers=hdr, json=body, timeout=20)
+        if r2.status_code in (200, 201):
+            print(f"  ✅ cron 已回寫: {new_line.strip()}")
+            return True
+        print(f"  ⚠️ cron 回寫失敗 HTTP {r2.status_code}: {r2.text[:160]}")
+        return False
+    except Exception as e:
+        print(f"  ⚠️ cron 回寫異常（不影響續期）: {str(e)[:140]}")
+        return False
 
 
 # ---------- 主入口 ----------
@@ -1200,7 +1363,8 @@ def main():
                 except Exception as e:
                     r = {"status": "❌ 状态读取失败" if IS_WATCHDOG else "❌ 续期失败",
                          "message": f"异常: {str(e)[:120]}"}
-                info = {"label": label, "server": sv, "status": r["status"], "message": r.get("message", "")}
+                info = {"label": label, "server": sv, "status": r["status"],
+                        "message": r.get("message", ""), "days": r.get("days")}
                 results.append(info)
                 print(f"  {info['status']} {info['message']}")
                 # watchdog 模式：正常就靜默（唔想日日嘈），只有「到期要人手」或「讀唔到」先出 TG
@@ -1210,6 +1374,21 @@ def main():
                 if should_tg:
                     send_tg(fmt_msg(info["status"], label, sv, info["message"]))
                 time.sleep(random.randint(2, 5))
+
+    # ---------- cron 自我調度（按到期日排下一次巡檢） ----------
+    # 攞全部 server 中剩餘天數最少嘅一台算窗口：
+    #   watchdog：窗口 = 到期前 WATCH_DAYS 日（即 days 啱啱跌到閾值嗰日）→ 提醒貼住臨界點
+    #   renew   ：窗口 = 到期前 1 日（同上游一致）
+    # 只喺「表達式真係變咗」先提交，所以穩定嘅到期日下唔會刷 commit。
+    days_list = [r["days"] for r in results if isinstance(r.get("days"), (int, float))]
+    if days_list:
+        min_days = min(days_list)
+        lead = WATCH_DAYS if IS_WATCHDOG else 1
+        expiry = datetime.now(timezone.utc) + timedelta(days=float(min_days))
+        print(f"\n⏱ 自我調度：最緊急剩 {min_days} 天（到期 {expiry.date()}）→ 目標 = 到期前 {lead} 日")
+        updateCronSchedule(expiry, lead_days=lead)
+    else:
+        print("\n⏱ 自我調度：本輪無有效天數讀數，跳過")
 
     if IS_WATCHDOG:
         bad = sum(1 for r in results if r["status"].startswith("❌"))
