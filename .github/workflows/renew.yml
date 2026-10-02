@@ -59,13 +59,13 @@ jobs:
           echo "Runner 出口 IP: $(curl -s --max-time 15 https://api.ipify.org || echo n/a)"
 
       - name: 🔄 执行续期（renew-kit）
-        uses: jardanlau2020/renew-kit/.github/actions/renew@v0.4.2
+        uses: jardanlau2020/renew-kit/.github/actions/renew@v0.5.3
         with:
           script: orihost_browser_renew.py
           python-version: "3.11"
           # 钉版本号而不是 @main：main 上出过一次 composite action 的语法错，
           # 所有 @main 的仓库一起变红。升级是显式动作，改这里两个 v0.4.2 即可。
-          renewkit-ref: v0.4.2
+          renewkit-ref: v0.5.3
           apt-packages: "xvfb xdotool scrot"
           # requirements.txt 里已有 seleniumbase/requests/curl_cffi，action 会
           # 自动装；pynacl 是 cron 回写那条路（GH 签名）用的，单独补。
