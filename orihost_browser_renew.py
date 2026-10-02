@@ -127,13 +127,26 @@ def _outcome_of(status: str, message: str = "") -> Outcome:
     return Outcome.FAILED
 
 
+#: message 开头重复的「剩 N 天（…）」——天数已经由 TargetResult.expire 渲染成
+#: 「（剩 N 天）」，再让 message 带一遍就会印成「剩 12 天 · 剩 12 天（>7 天…）」。
+_RE_LEAD_DAYS = re.compile(r"^\s*剩\s*\d+(?:\.\d+)?\s*天\s*(?:[（(][^）)]*[）)]\s*)?")
+
+
 def _detail_of(status: str, message: str) -> str:
     """给报告用的细节行。
 
     状态字本身（"❌ 续期失败"）对已经看过 TG 的人是零信息量 —— 真正有用的是
     后面那句 message（"Turnstile 验证 6 次未通过"）。所以优先用 message。
+
+    但 message 里跟 expire 重复的部分要剥掉，否则实盘报告长这样：
+        🟢 默认账号/36c736c8 · 状态良好（剩 12 天）
+        ℹ️ 剩 12 天 · 剩 12 天（>7 天，暫唔使理）      ← 一眼看上去像 bug
+    剥完是：
+        ℹ️ 剩 12 天 · 正常
     """
-    msg = shorten(message, 90)
+    msg = _RE_LEAD_DAYS.sub("", str(message or ""))
+    msg = msg.lstrip("→->·,，;； \t")
+    msg = shorten(msg, 90)
     if msg:
         return msg
     return shorten(status.strip("✅❌⚠️⏭️⏰ "), 90) or "执行失败"

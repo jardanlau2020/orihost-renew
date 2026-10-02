@@ -446,6 +446,18 @@ def test_pure(c: Checks) -> None:
     c.eq("A2 message 为空时退回 status（剥 emoji）",
          mod._detail_of("❌ 续期失败", ""), "续期失败")
     c.eq("A2 全空兜底", mod._detail_of("", ""), "执行失败")
+    # 实盘 #30 抓到的重复：「剩 12 天」被 expire 与 message 各印一次
+    c.eq("A2 剥掉与 expire 重复的「剩 N 天」（实盘 #30 的重复）",
+         mod._detail_of("✅ 正常", "剩 12 天（>7 天，暫唔使理）"), "正常")
+    c.eq("A2 剥掉重复天数后保留可操作信息",
+         mod._detail_of("⏰ 需人手續期",
+                        "剩 3 天（renewable=True）→ 去 panel 人手撳 Renew（GHA 過唔到 Turnstile）"),
+         "去 panel 人手撳 Renew（GHA 過唔到 Turnstile）")
+    c.eq("A2 不以「剩 N 天」开头的 message 不受影响",
+         mod._detail_of("❌ 狀態讀取失敗", "面板 API 讀唔到（execute_script 返 None）"),
+         "面板 API 讀唔到（execute_script 返 None）")
+    c.eq("A2 无括号的「剩 N 天」也剥掉",
+         mod._detail_of("✅ 正常", "剩 12 天"), "正常")
     long_msg = "x" * 300
     c.check("A2 长 message 被截断", len(mod._detail_of("❌", long_msg)) <= 90,
             f"len={len(mod._detail_of('❌', long_msg))}")
@@ -560,6 +572,10 @@ def test_scenarios(c: Checks) -> None:
     c.eq("B1 exit_code 0", rep.exit_code, 0)
     c.check("B1 全部 SKIPPED → notify_tg=False（静默，不发 TG）",
             all(r.outcome in mod.QUIET_OUTCOMES for r in rep.results))
+    # 报告正文不得出现重复天数（实盘 #30 的瑕疵）
+    rendered = rep.render()
+    c.check("B1 报告正文没有重复的「剩 30 天 · 剩 30 天」",
+            "剩 30 天 · 剩 30 天" not in rendered, rendered.replace("\n", " ⏎ "))
 
     # ---- B2 watchdog：剩 ≤ WATCH_DAYS → UNKNOWN，发 TG 但不标红 ----
     mod, rep, out = run_all_of(mode="watchdog", watch_days="7", **ACC1,
