@@ -20,6 +20,7 @@ on:
   schedule:
     # 每 3 天一次，UTC 10:00 = 北京时间 18:00（7 天有效期，提前续避免删机）
     - cron: '0 10 */3 * *'
+    - cron: '0 10 7 10 *'  # auto: renew-window=2026-10-07T10:00Z lead=7
   workflow_dispatch:
     inputs:
       mode:
