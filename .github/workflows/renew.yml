@@ -62,7 +62,11 @@ jobs:
       - name: 🔄 执行续期（renew-kit）
         uses: jardanlau2020/renew-kit/.github/actions/renew@v0.5.3
         with:
-          script: orihost_browser_renew.py
+          # 2026-10-08：改用上游 woshizaiyu/orihost-renew 嘅重寫版 app.py 做核心。
+          # 理由：我哋舊版係 SeleniumBase + CDP 硬砌，睇唔到 closed shadow DOM
+          # （廣告模態清唔到、Turnstile 搵唔到）；上游 10-05 按本地錄製重寫成
+          # Playwright 版（locator 天然穿透 shadow DOM），已迭代到 10-08。
+          script: app.py
           python-version: "3.11"
           # 钉版本号而不是 @main：main 上出过一次 composite action 的语法错，
           # 所有 @main 的仓库一起变红。升级是显式动作，改这里两个 v0.4.2 即可。
@@ -70,21 +74,33 @@ jobs:
           apt-packages: "xvfb xdotool scrot"
           # requirements.txt 里已有 seleniumbase/requests/curl_cffi，action 会
           # 自动装；pynacl 是 cron 回写那条路（GH 签名）用的，单独补。
-          pip-packages: "pynacl"
+          # app.py 要 playwright；requests[socks] 係 socks5 代理（sing-box）用。
+          # pynacl 係舊版 cron 回寫那條路用的，留住無害。
+          pip-packages: "pynacl playwright requests[socks]"
           # 代理是「尽力而为」：装不成或探不通都退回直连，所以保持默认的
           # continue-on-error=true，绝不因为代理挂了而中断续期。
           # ⚠️ 但直连对面板不友好 —— Cloudflare 对 runner 机房 IP 更凶，
           # watchdog 读天数都可能过唔到。NODE_LINK 必须传到（见下面 env）。
-          setup-command: "bash scripts/setup_proxy.sh"
+          setup-command: |
+            # 先裝真 Chrome（app.py 用 channel="chrome" + headless=False）
+            python -m playwright install --with-deps chrome || python -m playwright install --with-deps chromium
+            # 再起代理（我哋已修版，見 scripts/setup_proxy_upstream.sh）
+            bash scripts/setup_proxy.sh
           # SeleniumBase 的 UC 模式要真实 X 显示才能发系统级点击（过 CF 盾），
           # 所以主命令得套 xvfb-run，不能用默认的 python <script>。
-          command: 'xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 orihost_browser_renew.py'
+          command: 'xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py'
           artifact-paths: "*.png"
           artifact-name: orihost-shots
           notify-on-failure: "true"
         env:
           # 默認 watchdog；只有人手 dispatch 揀 mode=renew 先會真撳續期
+          # ⚠️ app.py（上游重寫版）唔讀 ORIHOST_MODE —— 佢自己會判斷：
+          #    未到窗口／Renew 置灰 → 直接跳過唔報錯；可以續才真撳。
+          #    所以排程由「只讀 watchdog」變成「到窗口就自動續」。
+          #    呢個 env 留住只為兼容舊版，app.py 會忽略。
           ORIHOST_MODE: ${{ inputs.mode || 'watchdog' }}
+          ARTICLE_WAIT: '15'
+          CLAIM_TIMEOUT: '60'
           ORIHOST_WATCH_DAYS: '7'
           ORIHOST_REMEMBER: ${{ secrets.ORIHOST_REMEMBER }}
           ORIHOST_SERVER_IDS: ${{ secrets.ORIHOST_SERVER_IDS }}
