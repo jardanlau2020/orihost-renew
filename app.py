@@ -208,17 +208,58 @@ def expand_turnstile(page):
         pass
 
 
+def challenge_frame_elements(page):
+    """frame 樹反查 challenge iframe（closed shadow DOM 唯一覆蓋法）。
+
+    ── 2026-10-08 我哋 fork 嘅補丁 ──
+    上游用 `page.locator('iframe[src*="challenges.cloudflare.com"]')` 判有冇驗證，
+    但新版 Turnstile 將挑戰 iframe 渲染喺 **closed shadow DOM** 入面，
+    任何 DOM 查詢（querySelectorAll / locator）都搵唔到 → `count()` 恆 0 →
+    `handle_cloudflare` 開頭就 `return True` 當「冇驗證」→ 唔撳 → 冇 token →
+    `Claim Renewal` 一直 disabled → 「超时未点到 Claim Renewal」。
+    （實證 run 37821801137：📅 当前剩余：6 天 / cooldown {'seconds': 0} /
+     點到 Renew 同 Read Article / 但「Turnstile token 未生成」。）
+
+    唯一覆蓋得到嘅方法係行 **`page.frames`（瀏覽器層 frame 樹）**反查 url 含
+    challenges.cloudflare.com，再用 `frame_element()` 攞返 iframe 元素。
+    （同一招喺 fridaydev 已驗證有效：`[FRAMES] challenge 命中 1`。）
+
+    返 [(element, box), ...]。
+    """
+    out = []
+    try:
+        for f in page.frames:
+            if "challenges.cloudflare.com" not in (f.url or ""):
+                continue
+            try:
+                fe = f.frame_element()
+                if not fe.is_visible():
+                    continue
+                box = fe.bounding_box()
+                if box and box.get("width", 0) > 10 and box.get("height", 0) > 10:
+                    out.append((fe, box))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
 def handle_cloudflare(page, timeout=90):
     """处理 Cloudflare Turnstile 验证（复用 Hiden 骨架写法）
     timeout：本轮最多等待秒数；轮询中请传小值（如 15），避免一轮卡死
     策略：iframe 内 checkbox 点 → 不行就 force 点 iframe 中心；每轮都带 token 检查"""
     iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
-    if page.locator(iframe_selector).count() == 0:
+    # 2026-10-08 補：唔可以只信 locator —— closed shadow DOM 下 count 恆 0。
+    _fr = challenge_frame_elements(page)
+    if not _fr and page.locator(iframe_selector).count() == 0:
         return True
-    log(f"⚠️ 检测到 Cloudflare 验证（共 {page.locator(iframe_selector).count()} 个验证框）...")
+    log(f"⚠️ 检测到 Cloudflare 验证（frame 樹命中 {len(_fr)} 個 / locator "
+        f"{page.locator(iframe_selector).count()} 個）...")
     start_time = time.time()
     while time.time() - start_time < timeout:
-        if page.locator(iframe_selector).count() == 0:
+        _fr = challenge_frame_elements(page)
+        if not _fr and page.locator(iframe_selector).count() == 0:
             log("✅ Cloudflare 验证通过！")
             return True
         # token 已有则直接过
@@ -234,6 +275,21 @@ def handle_cloudflare(page, timeout=90):
         # 策略1：先展开验证框，再真鼠标轨迹点击 checkbox（weirdhost 同款思路）
         expand_turnstile(page)
         clicked = False
+        # 策略0（2026-10-08 補）：用 frame 樹攞到嘅 iframe 元素直接撳 ——
+        # closed shadow DOM 下 locator 永遠 count=0，呢個係唯一撳得到嘅方法。
+        for _fe, _box in _fr:
+            try:
+                _fe.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+            try:
+                _fe.click(position={"x": min(30, _box["width"] / 2),
+                                    "y": _box["height"] / 2}, timeout=5000)
+                log("🖱️ 點 Turnstile iframe（frame 樹反查，closed shadow DOM）")
+                clicked = True
+                break
+            except Exception as e:
+                log(f"⚠️ frame 樹點擊失敗，退回 locator 路: {str(e)[:100]}")
         try:
             frame = page.frame_locator(iframe_selector)
             checkbox = frame.locator('input[type="checkbox"]')
