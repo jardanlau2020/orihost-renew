@@ -432,6 +432,26 @@ def ts_info(sb):
         return None, str(raw)[:80]
 
 
+def ts_info_cdp(sb):
+    """用 CDP `Runtime.evaluate` 讀 Turnstile 狀態（token 長度 + iframe rects）。
+
+    點解唔用 execute_script（2026-10-08 實證 run 37817479347）：
+      SeleniumBase 一旦行過 `driver.execute_cdp_cmd(...)`，之後 `execute_script`
+      會**靜默返 None**（唔會拋錯）—— 同 `wait_for_ready_state_complete` 嗰個坑
+      同源。症狀：第 1 輪正常、之後全部「读 Turnstile 状态失败: None」。
+      ⇒ 一轉 CDP 就全程 CDP：讀狀態用 Runtime.evaluate、點擊用 Input.dispatchMouseEvent。
+    """
+    try:
+        r = sb.driver.execute_cdp_cmd("Runtime.evaluate", {
+            "expression": _JS_TS_INFO, "returnByValue": True, "awaitPromise": False})
+        val = (r.get("result") or {}).get("value")
+        if val is None:
+            return None, "cdp 回 None"
+        return json.loads(val), None
+    except Exception as e:
+        return None, "cdp err:" + str(e)[:70]
+
+
 def ts_frames_cdp(sb):
     """用 CDP frame 樹搵 challenge iframe 嘅真實方框（返 (rects, err)）。
 
@@ -499,19 +519,34 @@ def handle_turnstile(sb) -> bool:
     经验（run 35452946138）：uc_gui_click_captcha 点极都过唔到，因为
     ① 面板免费方案会弹广告遮罩（Download is ready）盖住组件
     ② pyautogui 嘅盲点坐标撞正遮罩
-    所以改成：先清广告 → 读组件 iframe 真实坐标 → 用 CDP 派发真鼠标事件点 checkbox。
+    所以改成：先清广告 → 读组件真实坐标 → 用 CDP 派发真鼠标事件点 checkbox。
+
+    2026-10-08 大修（run 37815182349 / 37817479347 實證）：
+      · `iframe=[]`：`_JS_TS_INFO` 行 querySelectorAll('iframe')，但挑戰 iframe 收喺
+        **closed shadow DOM** → DOM 查詢永遠搵唔到 → 8 輪白等、由頭到尾冇撳過。
+        ⇒ 落 CDP `Page.getFrameTree` 反查（同 fridaydev 用 page.frames 同一個道理）。
+      · 一掂過 CDP，`execute_script` 就靜默返 None ⇒ 全程 CDP（Runtime.evaluate 讀狀態）。
+      · 清廣告（execute_script）必須喺轉 CDP **之前**做。
     """
     print("🔍 处理 Cloudflare Turnstile 验证...")
     time.sleep(2)
+
+    # ── JS 階段（趁 execute_script 仲正常）：靜默通過快檢 + 清廣告 ──
     try:
         if sb.execute_script(_SOLVED_JS):
             print("✅ 已静默通过")
             return True
     except Exception:
         pass
-    for attempt in range(8):
+    try:
         killed = kill_ad_overlay(sb)
-        info, err = ts_info(sb)
+    except Exception:
+        killed = "err"
+
+    # ── CDP 階段：之後全部唔再掂 execute_script ──
+    frames_probed = False
+    for attempt in range(8):
+        info, err = ts_info_cdp(sb)
         if info is None:
             print(f"  ⚠️ 读 Turnstile 状态失败: {err}")
             time.sleep(2)
@@ -522,23 +557,19 @@ def handle_turnstile(sb) -> bool:
             return True
         if attempt == 0:
             print(f"  组件: token_len={tok} iframe={rects} 清广告={killed}")
-        if not rects:
-            # 2026-10-08：可見 DOM 搵唔到唔等於冇 —— 挑戰 iframe 收喺 closed shadow DOM。
-            # 落 CDP frame 樹反查（run 37815182349 就係卡死喺呢一步，8 輪白等）。
+        if not rects and not frames_probed:
+            # 可見 DOM 搵唔到 ≠ 冇：挑戰 iframe 收喺 closed shadow DOM，落 CDP frame 樹反查
+            frames_probed = True
             cdp_rects, cerr = ts_frames_cdp(sb)
             if cdp_rects:
                 rects = cdp_rects
-                print(f"  🔎 可見 DOM 冇 iframe，但 CDP frame 樹搵到 {len(cdp_rects)} 個"
+                print(f"  🔎 可见 DOM 冇 iframe，但 CDP frame 樹搵到 {len(cdp_rects)} 個"
                       f"（closed shadow DOM）→ {cdp_rects[0]}")
-            else:
-                print(f"  ⚠️ 第 {attempt + 1} 轮：可见 DOM 同 CDP frame 樹都未见到"
-                      f" Turnstile iframe{f'（{cerr}）' if cerr else ''}，等一等再试")
-                time.sleep(3)
-                continue
-        try:
-            sb.execute_script(_EXPAND_JS)
-        except Exception:
-            pass
+        if not rects:
+            print(f"  ⚠️ 第 {attempt + 1} 轮：可见 DOM 同 CDP frame 樹都未见到"
+                  f" Turnstile iframe，等一等再试")
+            time.sleep(3)
+            continue
         x, y, w, h = rects[0]
         # checkbox 喺组件左侧约 24px 处、垂直居中
         cx, cy = x + 24, y + max(h // 2, 16)
@@ -546,7 +577,7 @@ def handle_turnstile(sb) -> bool:
         print(f"  ️ 第 {attempt + 1} 轮点 checkbox ({cx},{cy}) → {res}")
         for _ in range(10):
             time.sleep(1)
-            info, _ = ts_info(sb)
+            info, _ = ts_info_cdp(sb)
             if info and isinstance(info.get("token"), int) and info["token"] > 20:
                 print(f"✅ Turnstile 通过（第 {attempt + 1} 轮，token 长度 {info['token']}）")
                 return True
