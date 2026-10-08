@@ -224,7 +224,7 @@ def challenge_frame_elements(page):
     challenges.cloudflare.com，再用 `frame_element()` 攞返 iframe 元素。
     （同一招喺 fridaydev 已驗證有效：`[FRAMES] challenge 命中 1`。）
 
-    返 [(element, box), ...]。
+    返 [(element, box, frame), ...]（frame 用嚟開 frame-scoped CDP session）。
     """
     out = []
     try:
@@ -237,12 +237,63 @@ def challenge_frame_elements(page):
                     continue
                 box = fe.bounding_box()
                 if box and box.get("width", 0) > 10 and box.get("height", 0) > 10:
-                    out.append((fe, box))
+                    out.append((fe, box, f))
             except Exception:
                 continue
     except Exception:
         pass
     return out
+
+
+def ts_true_click(page, frame):
+    """用 frame-scoped CDP session 穿透 closed shadow DOM，攞 checkbox **真座標**再派真事件。
+
+    ── 2026-10-08 我哋 fork 嘅補丁（按 digest/procedure/cf-turnstile-shadow-dom-click.md）──
+    實證 run 37822542763：frame 樹反查成功（命中 1）、撳到 iframe 三次，但挑戰框
+    之後又返嚟、token 始終 0 → 撳中位置唔對。食譜明寫「不要凭可见 DOM 猜坐标」：
+    某案例一直撳 (222,312) 而真值係 (216,312)，只差 6px 就連續 24 輪點唔中。
+    正解：為該 frame 開獨立 CDP session → DOM.getDocument(pierce=True) 穿透 closed
+    shadow DOM → 對目標節點 getBoxModel 攞真座標 → 派 Input.dispatchMouseEvent。
+    注意：frame-scoped session 嘅 Input 座標係 frame 本地座標，唔使加 iframe 偏移。
+
+    返 (成功?, 說明)。
+    """
+    cdp = None
+    try:
+        cdp = page.context.new_cdp_session(frame)
+    except Exception as e:
+        return False, f"new_cdp_session 失敗: {str(e)[:60]}"
+    try:
+        doc = cdp.send("DOM.getDocument", {"pierce": True, "depth": -1})
+        root = doc["root"]["nodeId"]
+        for sel in ('input[type="checkbox"]', 'label', 'div#cf-turnstile', 'body'):
+            try:
+                nid = (cdp.send("DOM.querySelector",
+                                {"nodeId": root, "selector": sel}) or {}).get("nodeId") or 0
+            except Exception:
+                nid = 0
+            if not nid:
+                continue
+            try:
+                model = cdp.send("DOM.getBoxModel", {"nodeId": nid})["model"]["border"]
+            except Exception:
+                continue
+            x = (model[0] + model[2] + model[4] + model[6]) / 4.0
+            y = (model[1] + model[3] + model[5] + model[7]) / 4.0
+            for t in ("mouseMoved", "mousePressed", "mouseReleased"):
+                cdp.send("Input.dispatchMouseEvent",
+                         {"type": t, "x": x, "y": y, "button": "left", "clickCount": 1})
+                time.sleep(0.08)
+            return True, f"{sel} @ ({x:.0f},{y:.0f})"
+        return False, "pierce 後搵唔到 checkbox/label"
+    except Exception as e:
+        return False, f"cdp: {str(e)[:70]}"
+    finally:
+        try:
+            if cdp is not None:
+                cdp.detach()
+        except Exception:
+            pass
 
 
 def handle_cloudflare(page, timeout=90):
@@ -277,7 +328,14 @@ def handle_cloudflare(page, timeout=90):
         clicked = False
         # 策略0（2026-10-08 補）：用 frame 樹攞到嘅 iframe 元素直接撳 ——
         # closed shadow DOM 下 locator 永遠 count=0，呢個係唯一撳得到嘅方法。
-        for _fe, _box in _fr:
+        for _fe, _box, _fr_obj in _fr:
+            # 先試 CDP 真座標（穿透 closed shadow DOM，唔靠猜）
+            _ok, _why = ts_true_click(page, _fr_obj)
+            if _ok:
+                log(f"🖱️ CDP 真座標點 checkbox：{_why}")
+                clicked = True
+                break
+            log(f"⚠️ CDP 真座標路失敗（{_why}），退回 frame 元素點擊")
             try:
                 _fe.scroll_into_view_if_needed(timeout=3000)
             except Exception:
