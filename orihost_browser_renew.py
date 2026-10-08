@@ -353,6 +353,65 @@ _JS_CLICK_AD_CLOSE = """
 })()
 """
 
+# ── 2026-10-08：面板彈「You have 1 new message! $50,000 credited to your demo account」
+# 廣告模態（run 37818019788 截圖實證）。佢帶 role="dialog"/aria-modal，
+# 而舊 _JS_CLICK_AD_CLOSE 見到 role=dialog 就 `continue` 跳過 → 永遠清唔到 →
+# 「Claim Renewal」一直 disabled → Turnstile 根本唔會 render。
+# 所以另寫一個專治佢嘅 killer：認文案（new message / credited to your demo），
+# 喺模態內部撳 Close/Continue；冇掣就直接 remove 成個模態。
+_JS_KILL_AD_MODAL = """
+(function () {
+    var keys = ['new message', 'credited to your demo', 'demo account', '50,000'];
+    var boxes = document.querySelectorAll('[role="dialog"],[aria-modal="true"],div');
+    for (var i = 0; i < boxes.length; i++) {
+        var t = (boxes[i].innerText || '').toLowerCase();
+        if (!t || t.length > 400) continue;
+        var hit = false;
+        for (var k = 0; k < keys.length; k++) {
+            if (t.indexOf(keys[k]) >= 0) { hit = true; break; }
+        }
+        if (!hit) continue;
+        var cand = boxes[i].querySelectorAll('button,a,span,div');
+        for (var j = 0; j < cand.length; j++) {
+            var txt = (cand[j].textContent || '').trim();
+            if (['Close', 'Continue', '关闭', '繼續', '继续', '\u2715', '\u00d7'].indexOf(txt) < 0) continue;
+            var r = cand[j].getBoundingClientRect();
+            if (r.width === 0 && r.height === 0) continue;
+            try { cand[j].click(); return 'closed:' + txt; } catch (e) {}
+        }
+        try { boxes[i].remove(); return 'removed'; } catch (e) {}
+    }
+    return 'none';
+})()
+"""
+
+# ── 2026-10-08：SeleniumBase 一旦行過 execute_cdp_cmd，之後 execute_script 會
+# **靜默返 None**（同 wait_for_ready_state_complete 嗰個坑同源；run 37817479347 實證：
+# 第 1 輪正常、之後全部「读 Turnstile 状态失败: None」）。
+# js_eval 做兩件事：未掂過 CDP 就用 execute_script；一旦見到 None 就永久轉
+# Runtime.evaluate，令全條鏈（清廣告、搵掣、點掣）喺兩種模式下都行得通。
+_CDP_MODE = False
+
+
+def js_eval(sb, script):
+    global _CDP_MODE
+    if not _CDP_MODE:
+        try:
+            v = sb.execute_script(script)
+            if v is not None and v != "":
+                return v
+            _CDP_MODE = True
+            print("  ℹ️ execute_script 返 None → 轉 CDP Runtime.evaluate")
+        except Exception:
+            _CDP_MODE = True
+    try:
+        r = sb.driver.execute_cdp_cmd("Runtime.evaluate", {
+            "expression": script, "returnByValue": True, "awaitPromise": False})
+        return (r.get("result") or {}).get("value")
+    except Exception:
+        return None
+
+
 _JS_TS_INFO = """
 (function () {
     var inp = document.querySelector('input[name="cf-turnstile-response"]');
@@ -371,11 +430,20 @@ _JS_TS_INFO = """
 
 
 def kill_ad_overlay(sb):
-    """清走盖住 Turnstile 嘅广告遮罩；返清咗几多个"""
+    """清走盖住 Turnstile 嘅广告遮罩；返清咗几多个。
+
+    2026-10-08：加埋專治「You have 1 new message」模態嘅 killer（見 _JS_KILL_AD_MODAL）。
+    """
+    parts = []
     try:
-        return sb.execute_script(_JS_KILL_AD)
+        parts.append("modal=" + str(js_eval(sb, _JS_KILL_AD_MODAL)))
     except Exception as e:
-        return "err:" + str(e)[:60]
+        parts.append("modal=err:" + str(e)[:40])
+    try:
+        parts.append("overlay=" + str(js_eval(sb, _JS_KILL_AD)))
+    except Exception as e:
+        parts.append("overlay=err:" + str(e)[:40])
+    return " ".join(parts)
 
 
 def kill_page_ads(sb):
@@ -441,6 +509,8 @@ def ts_info_cdp(sb):
       同源。症狀：第 1 輪正常、之後全部「读 Turnstile 状态失败: None」。
       ⇒ 一轉 CDP 就全程 CDP：讀狀態用 Runtime.evaluate、點擊用 Input.dispatchMouseEvent。
     """
+    global _CDP_MODE
+    _CDP_MODE = True
     try:
         r = sb.driver.execute_cdp_cmd("Runtime.evaluate", {
             "expression": _JS_TS_INFO, "returnByValue": True, "awaitPromise": False})
@@ -466,6 +536,8 @@ def ts_frames_cdp(sb):
 
     返 rects = [[x, y, w, h], ...]（頁面座標，同 _JS_TS_INFO 同格式），err = 錯誤字串或 None。
     """
+    global _CDP_MODE
+    _CDP_MODE = True
     rects = []
     try:
         tree = sb.driver.execute_cdp_cmd("Page.getFrameTree", {})
@@ -799,7 +871,7 @@ def click_by_text(sb, text, timeout=10, exact=False):
     last = "not-found"
     while time.time() < end:
         try:
-            raw = sb.execute_script(script)
+            raw = js_eval(sb, script)          # 2026-10-08：CDP 模式下 execute_script 會返 None
             last = "js-null" if raw is None or raw == "" else str(raw)
         except Exception as e:
             last = "js-err:" + str(e)[:90]
@@ -1223,6 +1295,14 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     n_try = 0
     deadline = time.time() + CLAIM_TIMEOUT
     while time.time() < deadline:
+        # 2026-10-08：Claim Renewal 一直 disabled 嘅元兇就係嗰個廣告模態 —— 先閂佢
+        try:
+            mk = js_eval(sb, _JS_KILL_AD_MODAL)
+            if mk and mk != "none":
+                print(f"  🧹 已閂廣告模態: {mk}")
+                time.sleep(1)
+        except Exception:
+            pass
         res = click_by_text(sb, "claim renewal", timeout=6)
         sres = str(res)
         if sres.startswith("clicked"):
