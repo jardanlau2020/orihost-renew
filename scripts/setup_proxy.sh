@@ -23,7 +23,17 @@ set -uo pipefail
 
 PORT="${ORIHOST_SINGBOX_PORT:-1080}"
 PROBE_URL="${ORIHOST_PROXY_PROBE_URL:-https://api.ipify.org}"
-INSTALLER="${ORIHOST_PROXY_INSTALLER:-https://main.ssss.nyc.mn/setup_proxy.sh}"
+# 2026-10-08：改用 repo 內 vendored 版本，唔再抓遠端 URL。
+# 原因：遠端那份未修 —— 佢查 sing-box 最新版時打未認證 GitHub API，
+# runner 撞 rate limit（60/h/IP）會回 {"message":"..."} 而唔係陣列 → jq 報
+# "Cannot index string with string \"prerelease\"" → set -e 殺死腳本 →
+# 本 wrapper 見「安装脚本返回非零」→ 退成直連。
+# 實證：run 37814444853（2026-10-08 17:10Z）—— NODE_LINK 明明傳咗 175 字元，
+# 但 IS_PROXY=false，一直用 runner 機房 IP 打面板（即係 Cloudflare 最唔想見嘅）。
+# vendored 版已加：curl/jq 都 2>/dev/null || true、null 當查唔到 → 落 fallback 版本。
+# 要改回遠端：export ORIHOST_PROXY_INSTALLER=<url>。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALLER="${ORIHOST_PROXY_INSTALLER:-${SCRIPT_DIR}/setup_proxy_upstream.sh}"
 
 echo "── 0/4 检查节点配置 ──"
 if [ -z "${NODE_LINK:-}" ]; then
@@ -34,7 +44,10 @@ else
 fi
 
 echo "── 1/4 安装代理 ──"
-if command -v wget >/dev/null 2>&1; then
+if [ -f "$INSTALLER" ]; then
+  # 本地 vendored 版本
+  bash "$INSTALLER" || echo "⚠️ 安装脚本返回非零（继续验证）"
+elif command -v wget >/dev/null 2>&1; then
   bash <(wget -qO- "$INSTALLER") || echo "⚠️ 安装脚本返回非零（继续验证）"
 else
   bash <(curl -fsSL "$INSTALLER") || echo "⚠️ 安装脚本返回非零（继续验证）"
