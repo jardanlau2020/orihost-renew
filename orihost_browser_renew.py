@@ -393,6 +393,66 @@ _JS_KILL_AD_MODAL = """
 _CDP_MODE = False
 
 
+def kill_ad_modal_cdp(sb):
+    """用 CDP 搵「You have 1 new message」廣告模態並移走（穿透 closed shadow DOM）。
+
+    點解要 CDP（2026-10-08 兩次截圖實證）：JS 路 `document.querySelectorAll` 完全
+    搵唔到呢個模態（killer 回 none），但截圖清楚見到佢蓋住「Renew your server」對話框
+    →「Claim Renewal」一直 disabled → Turnstile 亦唔會 render。
+    即係佢收喺 shadow DOM 入面，只有 CDP DOM 域睇得到。
+
+    做法：DOM.performSearch（includeUserAgentShadowDOM）搵文案 → 沿 parentId 行到
+    最頂（但唔好過 BODY/HTML，免得拆咗成頁）→ DOM.removeNode 移走。
+    """
+    global _CDP_MODE
+    _CDP_MODE = True
+    for q in ("You have 1 new message", "credited to your demo", "50,000 credited"):
+        sid = None
+        try:
+            r = sb.driver.execute_cdp_cmd(
+                "DOM.performSearch", {"query": q, "includeUserAgentShadowDOM": True})
+            sid = r.get("searchId")
+            n = int(r.get("resultCount") or 0)
+            if not sid or n <= 0:
+                continue
+            got = sb.driver.execute_cdp_cmd(
+                "DOM.getSearchResults",
+                {"searchId": sid, "fromIndex": 0, "toIndex": min(n, 5)})
+            for nid in (got.get("nodeIds") or []):
+                top = nid
+                for _ in range(12):
+                    try:
+                        d = sb.driver.execute_cdp_cmd("DOM.describeNode", {"nodeId": top})
+                    except Exception:
+                        break
+                    pid = (d.get("node") or {}).get("parentId")
+                    if not pid:
+                        break
+                    try:
+                        pn = sb.driver.execute_cdp_cmd("DOM.describeNode", {"nodeId": pid})
+                    except Exception:
+                        break
+                    nm = ((pn.get("node") or {}).get("nodeName") or "").upper()
+                    if nm in ("BODY", "HTML", "#DOCUMENT"):
+                        break
+                    top = pid
+                try:
+                    sb.driver.execute_cdp_cmd("DOM.removeNode", {"nodeId": top})
+                    print(f"  🧹 CDP 已移走廣告模態（命中 {q!r}）")
+                    return "removed:" + q
+                except Exception as e:
+                    print(f"  ⚠️ CDP removeNode 失敗: {str(e)[:60]}")
+        except Exception as e:
+            print(f"  ⚠️ CDP 廣告模態搜尋失敗: {str(e)[:70]}")
+        finally:
+            if sid:
+                try:
+                    sb.driver.execute_cdp_cmd("DOM.cancelSearch", {"searchId": sid})
+                except Exception:
+                    pass
+    return "none"
+
+
 def js_eval(sb, script):
     global _CDP_MODE
     if not _CDP_MODE:
@@ -430,13 +490,17 @@ _JS_TS_INFO = """
 
 
 def kill_ad_overlay(sb):
-    """清走盖住 Turnstile 嘅广告遮罩；返清咗几多个。
+    """清走盖住 Turnstile 嘅广告遮罩；返字串描述結果。
 
-    2026-10-08：加埋專治「You have 1 new message」模態嘅 killer（見 _JS_KILL_AD_MODAL）。
+    2026-10-08：加埋專治「You have 1 new message」模態嘅 killer。
+    JS 路睇唔到（shadow DOM）就落 CDP 搜尋 + 移除（kill_ad_modal_cdp）。
     """
     parts = []
     try:
-        parts.append("modal=" + str(js_eval(sb, _JS_KILL_AD_MODAL)))
+        m1 = js_eval(sb, _JS_KILL_AD_MODAL)
+        parts.append("modal=" + str(m1))
+        if str(m1) == "none":
+            parts.append("modal_cdp=" + str(kill_ad_modal_cdp(sb)))
     except Exception as e:
         parts.append("modal=err:" + str(e)[:40])
     try:
@@ -1299,8 +1363,12 @@ def renew_one_server(sb, server_uuid: str) -> dict:
         try:
             mk = js_eval(sb, _JS_KILL_AD_MODAL)
             if mk and mk != "none":
-                print(f"  🧹 已閂廣告模態: {mk}")
+                print(f"  🧹 已閂廣告模態(JS): {mk}")
                 time.sleep(1)
+            else:
+                # JS 睇唔到（shadow DOM）→ 落 CDP 搜尋 + 移除
+                kill_ad_modal_cdp(sb)
+                time.sleep(0.5)
         except Exception:
             pass
         res = click_by_text(sb, "claim renewal", timeout=6)
