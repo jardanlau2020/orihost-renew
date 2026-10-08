@@ -35,6 +35,20 @@ if not (TG_BOT_TOKEN and TG_CHAT_ID) and ',' in _TG_BOT:
 BASE_URL = "https://panel.orihost.com"
 SERVER_SHORT_ID = "8651e616"  # 地址栏 /server/ 后面那段
 SERVER_UUID = "8651e616-52e2-46bb-8cbf-74159abb9815"  # 抓包实测：API 要用全量 UUID
+
+# ── 2026-10-08 補丁（我哋 fork）：上游只把 ORIHOST_SERVER_IDS 讀入變數，但**從來冇用過**
+# —— 上面兩行係硬編碼佢自己台（8651e616），README 寫「可選可填」實際唔生效。
+# 我哋台係 36c736c8-…，唔覆蓋就會去錯台，症狀係「✅ Cookie 登录成功」之後
+# 「⚠️ 未找到剩余天数文本 / 📝 cooldown 接口返回 {'http': 404} / ❌ 找不到 Renew 按钮」
+# （實證 run 37821351526）。
+# 支援：完整 UUID（36c736c8-xxxx-…）或短 ID（36c736c8）；多個以逗號分隔時取第一個。
+if ORIHOST_SERVER_IDS:
+    _ids = [x.strip() for x in ORIHOST_SERVER_IDS.replace(";", ",").split(",") if x.strip()]
+    if _ids:
+        _first = _ids[0]
+        if "-" in _first:
+            SERVER_UUID = _first
+        SERVER_SHORT_ID = _first.split("-")[0][:8]
 SERVER_URL = f"{BASE_URL}/server/{SERVER_SHORT_ID}"
 API_COOLDOWN = f"{BASE_URL}/api/client/servers/{SERVER_UUID}/renew/cooldown"
 API_BEGIN = f"{BASE_URL}/api/client/servers/{SERVER_UUID}/renew/begin"
