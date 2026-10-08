@@ -432,6 +432,54 @@ def ts_info(sb):
         return None, str(raw)[:80]
 
 
+def ts_frames_cdp(sb):
+    """用 CDP frame 樹搵 challenge iframe 嘅真實方框（返 (rects, err)）。
+
+    點解要咁做（2026-10-08 實證 run 37815182349）：
+      `_JS_TS_INFO` 行 `document.querySelectorAll('iframe')` → 報 `iframe=[]`，
+      8 輪都「未见到 Turnstile iframe」→ **由頭到尾冇撳過**。
+      原因：Cloudflare 將挑戰 iframe 渲染喺 **closed shadow DOM** 入面，
+      任何 DOM 查詢（querySelectorAll / locator）都搵唔到；
+      唯一覆蓋得到嘅方法係行**瀏覽器層 frame 樹**（CDP `Page.getFrameTree`），
+      再用 frameOwner(backendNodeId) → `DOM.getBoxModel` 攞 iframe 喺頁面嘅方框。
+      （同一堵牆 fridaydev 10-08 都撞過，佢用 Playwright 嘅 page.frames 解決。）
+
+    返 rects = [[x, y, w, h], ...]（頁面座標，同 _JS_TS_INFO 同格式），err = 錯誤字串或 None。
+    """
+    rects = []
+    try:
+        tree = sb.driver.execute_cdp_cmd("Page.getFrameTree", {})
+    except Exception as e:
+        return rects, "getFrameTree err:" + str(e)[:60]
+    stack = [tree.get("frameTree")]
+    while stack:
+        node = stack.pop()
+        if not node:
+            continue
+        for ch in (node.get("childFrames") or []):
+            stack.append(ch)
+        fr = node.get("frame") or {}
+        url = fr.get("url") or ""
+        if "challenges.cloudflare.com" not in url:
+            continue
+        owner = fr.get("frameOwner")          # subframe 先有 backendNodeId
+        if not owner:
+            continue
+        try:
+            nid = sb.driver.execute_cdp_cmd(
+                "DOM.pushNodesByBackendIdsToFrontend",
+                {"backendNodeIds": [owner]})["nodeIds"][0]
+            box = sb.driver.execute_cdp_cmd("DOM.getBoxModel", {"nodeId": nid})["model"]["border"]
+            xs, ys = box[0::2], box[1::2]
+            x, y = int(min(xs)), int(min(ys))
+            w, h = int(max(xs) - min(xs)), int(max(ys) - min(ys))
+            if w > 10 and h > 10:
+                rects.append([x, y, w, h])
+        except Exception as e:
+            print(f"  ⚠️ CDP 攞 challenge frame 方框失敗: {str(e)[:80]}")
+    return rects, None
+
+
 def ts_click_cdp(sb, x, y):
     """用 CDP 派发真鼠标事件点 checkbox（唔依赖 X11/pyautogui，坐标係视口坐标）"""
     try:
@@ -475,9 +523,18 @@ def handle_turnstile(sb) -> bool:
         if attempt == 0:
             print(f"  组件: token_len={tok} iframe={rects} 清广告={killed}")
         if not rects:
-            print(f"  ⚠️ 第 {attempt + 1} 轮：未见到 Turnstile iframe，等一等再试")
-            time.sleep(3)
-            continue
+            # 2026-10-08：可見 DOM 搵唔到唔等於冇 —— 挑戰 iframe 收喺 closed shadow DOM。
+            # 落 CDP frame 樹反查（run 37815182349 就係卡死喺呢一步，8 輪白等）。
+            cdp_rects, cerr = ts_frames_cdp(sb)
+            if cdp_rects:
+                rects = cdp_rects
+                print(f"  🔎 可見 DOM 冇 iframe，但 CDP frame 樹搵到 {len(cdp_rects)} 個"
+                      f"（closed shadow DOM）→ {cdp_rects[0]}")
+            else:
+                print(f"  ⚠️ 第 {attempt + 1} 轮：可见 DOM 同 CDP frame 樹都未见到"
+                      f" Turnstile iframe{f'（{cerr}）' if cerr else ''}，等一等再试")
+                time.sleep(3)
+                continue
         try:
             sb.execute_script(_EXPAND_JS)
         except Exception:
