@@ -1309,22 +1309,28 @@ def renew_one_server(sb, server_uuid: str) -> dict:
             print(f"  \U0001f5b1\ufe0f 点 Claim Renewal: {sres}")
             clicked = True
             break
+        # 2026-10-08：判據由 _HAS_TURNSTILE_JS 改成 CDP frame 樹。
+        # _HAS_TURNSTILE_JS 只係睇「有冇隱藏 token input」——但個 input 一開對話框就存在，
+        # 於是 Claim 仲係 disabled 就衝入 handle_turnstile，白燒 8 輪（~30s）然後直接判死，
+        # 完全冇等過 Claim 變 enabled（run 37818767183 實證：一次 claim 都未試過）。
+        # 真判據＝CDP frame 樹見到 challenges.cloudflare.com 嘅 frame（closed shadow DOM
+        # 唯一睇得到嘅方法）；見到就係真挑戰，見唔到就繼續等 Claim。
         if ts_state is None:
             try:
-                has_ts = sb.execute_script(_HAS_TURNSTILE_JS)
+                frames, _ferr = ts_frames_cdp(sb)
             except Exception:
-                has_ts = False
-            if has_ts:
+                frames = []
+            if frames:
+                print(f"  🛡️ 見到真 challenge frame {frames[0]} → 處理 Turnstile")
                 ts_state = handle_turnstile(sb)
                 if ts_state is False:
                     sb.save_screenshot(f"turnstile_fail_{sid}.png")
                     return {"status": "\u274c 续期失败", "message": "Turnstile 验证 6 次未通过"}
-            else:
-                pass  # 统一由下面嘅状态行打印
         if not clicked and ts_state is None:
             n_try += 1
-            if n_try <= 4 or n_try % 6 == 0:
-                print(f"    （第 {n_try} 次：state={detect_state(sb)!r} 倒计时={dialog_countdown(sb)} claim={sres[:40]}）")
+            if n_try <= 6 or n_try % 5 == 0:
+                print(f"    （第 {n_try} 次：state={detect_state(sb)!r} "
+                      f"倒计时={dialog_countdown(sb)} claim={sres[:40]}）")
         time.sleep(3)
     if not clicked:
         sb.save_screenshot(f"no_claim_btn_{sid}.png")
