@@ -12,13 +12,14 @@
 
 ```text
 orihost-renew/
-├── orihost_browser_renew.py    # 主力：浏览器版（Cookie免登+读文章+Turnstile+Claim），
-│                               #       已迁移到 renew-kit（见下「renew-kit 迁移」）
+├── app.py                      # 主力：Playwright 版（Cookie免登+读文章+Turnstile+Claim），
+│                               #       workflow 实际跑的脚本；自带 TG 通知 + cron 自我調度
+├── orihost_browser_renew.py    # 旧主力：SeleniumBase 版（已迁移到 renew-kit，保留参考）
 ├── orihost_renew.py            # 备用：纯 API 版（仅满额检测/诊断，claim 过唔到验证）
-├── requirements.txt            # 依赖：curl_cffi + requests + seleniumbase
+├── requirements.txt            # 依赖：curl_cffi + requests + playwright + seleniumbase
 ├── scripts/setup_proxy.sh      # 代理引导：装 sing-box → 真探测出口 → 写 GITHUB_ENV
 ├── .github/workflows/renew.yml # Actions：每 3 天 watchdog 巡检 + 手动触发
-├── .verify/verify_orihost.py   # 离线验收 harness（188 项断言，不碰真浏览器）
+├── .verify/verify_orihost.py   # 离线验收 harness（app.py，不碰真浏览器）
 ├── .verify/probe_cron_writeback.py  # 端到端探针：真跑 cron 回写（打桩 GitHub API）
 └── README.md                   # 本说明文件
 ```
@@ -26,8 +27,12 @@ orihost-renew/
 ## renew-kit 迁移
 
 环境变量读取、结果语义、报告排版、TG 通知、退出码这些通用部分交给
-[`renew-kit`](https://github.com/jardanlau2020/renew-kit)（钉 `v0.4.2`），
+[`renew-kit`](https://github.com/jardanlau2020/renew-kit)（钉 `v0.5.3`），
 workflow 里只留一个 composite action 调用。本仓自己保留业务逻辑。
+
+> **2026-10-08 起**：续期核心改用上游重写版 `app.py`（Playwright，locator 天然
+> 穿透 shadow DOM，比旧 SeleniumBase 版更稳）。`app.py` 自带 TG 通知与 cron
+> 自我調度，不依赖 renewkit 包；composite action 只负责装依赖 / 跑脚本 / 传产物。
 
 行为变化（每条都有据）：
 

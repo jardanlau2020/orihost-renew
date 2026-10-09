@@ -23,11 +23,11 @@ import sys
 import tempfile
 import types
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent          # _sync/orihost-renew
-SCRIPT = REPO / "orihost_browser_renew.py"
+SCRIPT = REPO / "app.py"
 REAL_WF = REPO / ".github" / "workflows" / "renew.yml"
 
 FAILURES: list[str] = []
@@ -74,10 +74,10 @@ def _fake_put(url, headers=None, json=None, timeout=None, **kw):
 
 
 def install_stubs() -> None:
-    """requests 换成只认 get/put 的替身（要拦 Contents API），seleniumbase 也塞一个。
+    """requests 换成只认 get/put 的替身（要拦 Contents API），playwright 也塞一个。
 
-    ⚠️ 必须在 import 被测脚本之前装：renewkit.http 顶层就 import requests，
-    晚一步就拿到真身，PUT 会真的发出去。
+    ⚠️ 必须在 import 被测脚本之前装：app.py 顶层就 import requests 与
+    playwright.sync_api，晚一步就拿到真身，PUT 会真的发出去。
     """
     req = types.ModuleType("requests")
     req.get = _fake_get
@@ -85,21 +85,14 @@ def install_stubs() -> None:
     req.RequestException = Exception
     req.Session = type("Session", (), {"__init__": lambda self, *a, **k: None})
     req.Response = _Resp
-
-    adapters = types.ModuleType("requests.adapters")
-    adapters.HTTPAdapter = type("HTTPAdapter", (), {"__init__": lambda self, *a, **k: None})
-    req.adapters = adapters
     sys.modules["requests"] = req
-    sys.modules["requests.adapters"] = adapters
 
-    for name in ("urllib3", "urllib3.util", "urllib3.util.retry"):
-        sys.modules.setdefault(name, types.ModuleType(name))
-    sys.modules["urllib3.util.retry"].Retry = type(
-        "Retry", (), {"__init__": lambda self, *a, **k: None})
-
-    sb = types.ModuleType("seleniumbase")
-    sb.SB = type("SB", (), {"__init__": lambda self, *a, **k: None})
-    sys.modules["seleniumbase"] = sb
+    pw = types.ModuleType("playwright")
+    pw_sa = types.ModuleType("playwright.sync_api")
+    pw_sa.sync_playwright = lambda *a, **k: None
+    pw.sync_api = pw_sa
+    sys.modules["playwright"] = pw
+    sys.modules["playwright.sync_api"] = pw_sa
 
 
 def add_renewkit_path() -> None:
@@ -165,8 +158,13 @@ def main() -> int:
         expect("基准 cron 行可被 _CRON_LINE_RE 命中", len(anchors) >= 1,
                f"n={len(anchors)}")
 
-        # 3) 真跑一次回写
-        expiry = datetime(2026, 10, 15, 10, 0, tzinfo=timezone.utc)
+        # 3) 真跑一次回写。
+        #    ⚠️ 到期日必须相对「现在」算：updateCronSchedule 有一条
+        #    「窗口已過 → 退回明日 10:00」的兜底，硬编码过去日期会走到那条分支。
+        now = datetime.now(timezone.utc)
+        expiry = (now + timedelta(days=30)).replace(
+            hour=10, minute=0, second=0, microsecond=0)
+        want1 = mod._cron_expr(expiry - timedelta(days=7))
         _captured.clear()
         with redirect_stdout(io.StringIO()) as buf:
             wrote = mod.updateCronSchedule(expiry, lead_days=7)
@@ -190,8 +188,7 @@ def main() -> int:
             updated = ""
 
         # 4) 回写内容：auto 行写进去了，基准行没被破坏
-        #    到期 10-15 减 lead=7 → 10-08
-        expect("auto cron 行写入（0 10 8 10 *）", "0 10 8 10 *" in updated)
+        expect(f"auto cron 行写入（{want1}）", want1 in updated)
         expect("基准 cron 行原样保留（永不可变）",
                "    - cron: '0 10 */3 * *'" in updated)
         rows = list(mod._CRON_LINE_RE.finditer(updated))
@@ -199,7 +196,7 @@ def main() -> int:
         auto = mod._AUTO_LINE_RE.search(updated)
         expect("auto 行可被 _AUTO_LINE_RE 回读", auto is not None)
         expect("回读的 cron 与预期一致",
-               bool(auto) and auto.group("cron") == "0 10 8 10 *",
+               bool(auto) and auto.group("cron") == want1,
                auto.group("cron") if auto else "None")
 
         # 5) 幂等：模拟第一次的 commit 已落地（写回临时文件），再跑一次
@@ -212,16 +209,18 @@ def main() -> int:
         expect("同日重跑不发 PUT（不刷 commit）", "put_url" not in _captured)
 
         # 6) 换了到期日则要更新（不能一味跳过）
+        expiry2 = (now + timedelta(days=60)).replace(
+            hour=10, minute=0, second=0, microsecond=0)
+        want2 = mod._cron_expr(expiry2 - timedelta(days=7))
         _captured.clear()
         with redirect_stdout(io.StringIO()):
-            wrote3 = mod.updateCronSchedule(
-                datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc), lead_days=7)
+            wrote3 = mod.updateCronSchedule(expiry2, lead_days=7)
         expect("换到期日 → 重新回写 True", wrote3 is True)
         body3 = _captured.get("put_body") or {}
         upd3 = base64.b64decode(body3["content"]).decode("utf-8") if body3 else ""
         expect("旧 auto 行被替换而不是叠加",
                upd3.count(mod._AUTO_TAG) == 1, f"auto行数={upd3.count(mod._AUTO_TAG)}")
-        expect("新 cron 为 0 10 13 11 *", "0 10 13 11 *" in upd3)
+        expect(f"新 cron 为 {want2}", want2 in upd3)
 
         os.chdir(cwd0)
         expect("仓库真文件未被改动", REAL_WF.read_text(encoding="utf-8") == real_before)
