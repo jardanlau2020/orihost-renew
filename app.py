@@ -12,7 +12,9 @@ import sys
 import time
 import random
 import html
+import base64
 import requests
+from datetime import datetime, timedelta, timezone
 from playwright.sync_api import sync_playwright
 
 # --- 环境变量 ---
@@ -811,6 +813,151 @@ def renew_service(page):
         return False
 
 
+# ══════════════════════════════════════════════════════════════════════
+# cron 自我調度（2026-10-09 從 orihost_browser_renew.py 移植）
+# ──────────────────────────────────────────────────────────────────────
+# 背景：workflow 註釋描述的「按最緊急到期日改寫 cron」由腳本負責；但續期核心
+# 換成 app.py（上游 Playwright 重寫版）之後，呢段邏輯冇跟住搬過來 → auto 行
+# 永遠唔更新、功能靜默失效。現補回，行為同舊腳本一致。
+#
+# 追加式寫法：基準行（`0 10 */3 * *`）永不可變，auto 行最多一條。
+# 回寫走 Contents API（帶 token），唔靠 git push。
+# ══════════════════════════════════════════════════════════════════════
+_AUTO_TAG = "# auto: renew-window="
+_AUTO_LINE_RE = re.compile(
+    r"^[ \t]*-[ \t]*cron:[ \t]*(?P<q>['\"])(?P<cron>[^'\"]*)(?P=q)[^\n]*"
+    + re.escape(_AUTO_TAG) + r"[^\n]*\n?",
+    re.M,
+)
+_CRON_LINE_RE = re.compile(
+    r"^[ \t]*-[ \t]*cron:[ \t]*(['\"])[^'\"]*\1[^\n]*$", re.M
+)
+_TRUTHY = frozenset({"1", "true", "yes", "y", "on"})
+
+
+def _env_get(name: str, default: str = "") -> str:
+    return (os.environ.get(name) or default).strip()
+
+
+def _env_dry_run(name: str = "DRY_RUN") -> bool:
+    return _env_get(name).lower() in _TRUTHY
+
+
+def _workflow_path():
+    for name in ("renew.yml", "renew-browser.yml"):
+        p = os.path.join(os.getcwd(), ".github", "workflows", name)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _cron_expr(next_run) -> str:
+    """窗口定時表達式：帶月/日（唔用 *），避免殘留行每月誤觸。"""
+    return f"0 10 {next_run.day} {next_run.month} *"
+
+
+def _build_auto_line(next_run, lead_days: int) -> str:
+    return (
+        f"    - cron: '{_cron_expr(next_run)}'"
+        f"  {_AUTO_TAG}{next_run.strftime('%Y-%m-%dT%H:%MZ')} lead={lead_days}"
+    )
+
+
+def updateCronSchedule(expires_at, lead_days: int = 1) -> bool:
+    """按到期時間追加/更新一條 auto cron，令下次巡檢落在「到期前 lead_days 日」。
+
+    任何異常都唔會拋出去（回 False），確保 cron 問題絕不影響續期。
+    """
+    if _env_dry_run():
+        log("  ℹ️ DRY_RUN 演練，跳過 cron 回寫")
+        return False
+    if (_env_get("GITHUB_ACTIONS") or "").lower() != "true":
+        log("  ℹ️ 非 CI 環境，跳過 cron 回寫")
+        return False
+    repo = _env_get("GITHUB_REPOSITORY")
+    if "/" not in repo:
+        log("  ℹ️ 無 GITHUB_REPOSITORY，跳過 cron 回寫")
+        return False
+    token = _env_get("GH_ROTATE_TOKEN") or _env_get("GH_TOKEN")
+    if not token:
+        log("  ℹ️ 未提供 GH_ROTATE_TOKEN / GH_TOKEN，跳過 cron 回寫")
+        return False
+
+    wf = _workflow_path()
+    if not wf:
+        log("  ⚠️ 未找到 workflow 檔案，跳過 cron 回寫")
+        return False
+
+    try:
+        if isinstance(expires_at, datetime):
+            t = expires_at
+        else:
+            t = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+
+        def _snap(dt_):
+            # 對齊基準 cron 嘅 10:00 UTC，避免每次 run 因分秒唔同而多一個 commit
+            return dt_.astimezone(timezone.utc).replace(
+                hour=10, minute=0, second=0, microsecond=0)
+
+        next_run = _snap(t - timedelta(days=max(0, int(lead_days))))
+        if next_run <= datetime.now(timezone.utc):
+            next_run = _snap(datetime.now(timezone.utc) + timedelta(hours=12))
+
+        new_line = _build_auto_line(next_run, max(0, int(lead_days)))
+
+        with open(wf, "r", encoding="utf-8") as f:
+            old = f.read()
+
+        prev = _AUTO_LINE_RE.search(old)
+        if prev:
+            if prev.group("cron") == _cron_expr(next_run):
+                log(f"  ℹ️ auto cron 無需變更（{prev.group('cron')}）")
+                return False
+            updated = old[:prev.start()] + new_line + "\n" + old[prev.end():]
+        else:
+            last = None
+            for last in _CRON_LINE_RE.finditer(old):
+                pass
+            if last is None:
+                log("  ⚠️ workflow 無 cron 行，跳過 cron 回寫")
+                return False
+            insert_at = last.end()
+            updated = old[:insert_at] + "\n" + new_line + old[insert_at:]
+
+        if updated == old:
+            log("  ℹ️ cron 無需變更")
+            return False
+
+        api = f"https://api.github.com/repos/{repo}/contents/.github/workflows/{os.path.basename(wf)}"
+        hdr = {"Authorization": f"Bearer {token}",
+               "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28"}
+        branch = _env_get("GITHUB_REF_NAME") or "main"
+        r = requests.get(f"{api}?ref={branch}", headers=hdr, timeout=20)
+        if r.status_code != 200:
+            log(f"  ⚠️ 讀 workflow 失敗 HTTP {r.status_code}: {r.text[:120]}")
+            return False
+        sha = r.json().get("sha")
+        body = {
+            "message": f"chore(cron): 下次巡檢 {next_run.strftime('%Y-%m-%d %H:%M UTC')}",
+            "content": base64.b64encode(updated.encode("utf-8")).decode(),
+            "branch": branch,
+        }
+        if sha:
+            body["sha"] = sha
+        r2 = requests.put(api, headers=hdr, json=body, timeout=20)
+        if r2.status_code in (200, 201):
+            log(f"  ✅ cron 已回寫: {new_line.strip()}")
+            return True
+        log(f"  ⚠️ cron 回寫失敗 HTTP {r2.status_code}: {r2.text[:160]}")
+        return False
+    except Exception as e:
+        log(f"  ⚠️ cron 回寫異常（不影響續期）: {str(e)[:140]}")
+        return False
+
+
 def main():
     if not ORIHOST_REMEMBER:
         log("❌ 缺少登录凭证：请设置 ORIHOST_REMEMBER（remember_web token 值）")
@@ -850,6 +997,17 @@ def main():
 
             # ── watchdog 模式：只讀監看，唔自動撳（2026-10-09 用戶拍板）────────
             if MODE != "renew":
+                # cron 自我調度：按到期日把下一次巡檢寫回 workflow
+                if old_days is not None:
+                    try:
+                        _expiry = datetime.now(timezone.utc) + timedelta(days=float(old_days))
+                        log(f"⏱ 自我調度：剩 {old_days} 天 → 目標 = 到期前 {WATCHDOG_ALERT_DAYS} 日")
+                        updateCronSchedule(_expiry, lead_days=WATCHDOG_ALERT_DAYS)
+                    except Exception as _e:
+                        log(f"⚠️ cron 自我調度異常（不影響續期）: {str(_e)[:140]}")
+                else:
+                    log("⏱ 自我調度：本輪無有效天數讀數，跳過")
+
                 window_open, note = watchdog_check(page)
                 log(f"🔒【watchdog 讀數】{note}")
                 if window_open is None:
