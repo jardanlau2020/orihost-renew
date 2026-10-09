@@ -64,6 +64,18 @@ IS_PROXY = (os.environ.get('IS_PROXY', 'false').lower() == 'true') or bool(_MANU
 PROXY_SERVER = os.environ.get('PROXY_SERVER') or _MANUAL_PROXY or "socks5://127.0.0.1:1080"
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
 
+# --- 模式（2026-10-09 加）---------------------------------------------------
+# watchdog：只讀監看。到續期窗口 → TG 提醒人手撳，**唔會自動撳**。
+#   背景：2026-10-09 用只讀探針（renew-kit tools/shield_probe.py）實證，
+#   站方 Turnstile 判定嘅係自動化瀏覽器環境，唔係出口 IP —— 機房（本機 SG、
+#   節點 UAE/HK）同**住宅家寬（HK HKT 42.200.173.5）**一樣判敗；同一部瀏覽器
+#   同一頁換官方 dummy sitekey 1x00000000000000000000AA 就 5.1 秒攞到 token。
+#   即係換節點解決唔到 → 按用戶拍板降級做 watchdog + 人手撳。
+# renew：維持原本全自動嘗試（留返做 dispatch 用）。
+MODE = (os.environ.get('ORIHOST_MODE') or 'watchdog').strip().lower()
+# watchdog 模式剩幾日先出「預備提醒」（> 呢個數就靜默）
+WATCHDOG_ALERT_DAYS = int(os.environ.get('ORIHOST_ALERT_DAYS') or "2")
+
 # remember_web cookie 名（bundle.json 12:59 录制快照实测）
 REMEMBER_COOKIE_NAME = "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d"
 
@@ -541,6 +553,39 @@ def get_renewal_days(page):
     return None
 
 
+def watchdog_check(page):
+    """只讀：判有冇到續期窗口。**唔撳任何掣、唔過 Turnstile、唔提交**。
+
+    回傳 (window_open, note)：
+      True  = 窗口開咗（Renew 掣可撳、無冷卻、無 Renew Limit Reached）
+      False = 未到窗口
+      None  = 讀唔到（面板載入失敗／CF 擋），保守當「未開」但會照 TG 講一聲
+    """
+    secs = api_cooldown(page)
+    try:
+        if SERVER_SHORT_ID not in page.url:
+            page.goto(SERVER_URL, wait_until="domcontentloaded", timeout=60000)
+        time.sleep(2)
+        close_center_ad(page)
+        body = page.locator("body").inner_text(timeout=10000)
+    except Exception as e:
+        return None, f"讀面板失敗: {type(e).__name__}: {e}"
+
+    if "Renew Limit Reached" in body or "renewal limit" in body.lower():
+        return False, "Renew Limit Reached（未到窗口）"
+    try:
+        btn = page.locator('button:has-text("Renew")').first
+        if btn.count() == 0:
+            return False, "搵唔到 Renew 掣"
+        if btn.is_disabled():
+            return False, "Renew 掣置灰（disabled）"
+    except Exception as e:
+        return None, f"讀 Renew 掣失敗: {type(e).__name__}: {e}"
+    if secs is not None and secs > 0:
+        return False, f"冷卻中（{secs}s）"
+    return True, "Renew 掣可撳 + 無冷卻 → 窗口開咗"
+
+
 def renew_service(page):
     """Orihost 续期芯：Renew → Read Article（新标签 dwell）→ Turnstile → Claim Renewal
     返回 True / False / "NOT_TIME"（冷却中或未到续期条件）"""
@@ -800,6 +845,32 @@ def main():
             # 续期前剩余天数
             old_days = get_renewal_days(page)
             old_due = f"剩余 {old_days} 天" if old_days is not None else "未知"
+
+            # ── watchdog 模式：只讀監看，唔自動撳（2026-10-09 用戶拍板）────────
+            if MODE != "renew":
+                window_open, note = watchdog_check(page)
+                log(f"🔒【watchdog 讀數】{note}")
+                if window_open is None:
+                    log("⚠️ 讀唔到面板狀態 → TG 講一聲，唔標紅")
+                    send_telegram_notification(f"⚠️ watchdog 讀唔到面板狀態：{note}",
+                                               old_due, old_due, current_ip)
+                    sys.exit(0)
+                if window_open:
+                    log("🔔【可續期窗口已開】watchdog 模式唔會自動撳，已 TG 提醒人手")
+                    send_telegram_notification(
+                        "🔔 已進入續期窗口，請人手撳（watchdog 模式唔會自動撳）",
+                        old_due, old_due, current_ip)
+                    # 需要人手 = 要人注意 → 標紅（同 FridayDev watchdog 語義一致：
+                    # 映射成非 FAILED 就等於永久綠燈，watchdog 白裝）
+                    sys.exit(1)
+                if old_days is not None and old_days <= WATCHDOG_ALERT_DAYS:
+                    log(f"⏳ 剩 {old_days} 日 ≤ {WATCHDOG_ALERT_DAYS} 日 → 預備提醒")
+                    send_telegram_notification(
+                        f"⏳ 未可續（仲有 {old_days} 日）· 預備提醒",
+                        old_due, old_due, current_ip)
+                    sys.exit(0)
+                log(f"😴 未到窗口（剩 {old_days} 日）→ 靜默，唔發 TG")
+                sys.exit(0)
 
             # 执行续期
             renew_result = renew_service(page)

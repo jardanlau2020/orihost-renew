@@ -94,10 +94,11 @@ jobs:
           notify-on-failure: "true"
         env:
           # 默認 watchdog；只有人手 dispatch 揀 mode=renew 先會真撳續期
-          # ⚠️ app.py（上游重寫版）唔讀 ORIHOST_MODE —— 佢自己會判斷：
-          #    未到窗口／Renew 置灰 → 直接跳過唔報錯；可以續才真撳。
-          #    所以排程由「只讀 watchdog」變成「到窗口就自動續」。
-          #    呢個 env 留住只為兼容舊版，app.py 會忽略。
+          # ✅ 2026-10-09：app.py 已讀 ORIHOST_MODE。默認 watchdog＝只讀監看，
+          #    窗口開 → TG 提醒人手撳（唔會自動撳，亦唔會日日假紅）。
+          #    背景：只讀探針實證 Turnstile 判嘅係自動化環境、唔係出口 IP
+          #    （住宅家寬 42.200.173.5 一樣判敗），換節點解決唔到。
+          #    要全自動試：dispatch 時 mode=renew。
           ORIHOST_MODE: ${{ inputs.mode || 'watchdog' }}
           ARTICLE_WAIT: '15'
           CLAIM_TIMEOUT: '60'
