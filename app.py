@@ -73,8 +73,9 @@ REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY els
 #   即係換節點解決唔到 → 按用戶拍板降級做 watchdog + 人手撳。
 # renew：維持原本全自動嘗試（留返做 dispatch 用）。
 MODE = (os.environ.get('ORIHOST_MODE') or 'watchdog').strip().lower()
-# watchdog 模式剩幾日先出「預備提醒」（> 呢個數就靜默）
-WATCHDOG_ALERT_DAYS = int(os.environ.get('ORIHOST_ALERT_DAYS') or "2")
+# watchdog 模式剩幾日先出「預備提醒」（> 呢個數就靜默）。
+# 默認 3：同 FridayDev watchdog 嘅 urgent 門檻（≤3 日）一致。
+WATCHDOG_ALERT_DAYS = int(os.environ.get('ORIHOST_ALERT_DAYS') or "3")
 
 # remember_web cookie 名（bundle.json 12:59 录制快照实测）
 REMEMBER_COOKIE_NAME = "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d"
