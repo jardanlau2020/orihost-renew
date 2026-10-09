@@ -11,6 +11,7 @@ import re
 import sys
 import time
 import random
+import html
 import requests
 from playwright.sync_api import sync_playwright
 
@@ -75,7 +76,7 @@ REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY els
 MODE = (os.environ.get('ORIHOST_MODE') or 'watchdog').strip().lower()
 # watchdog 模式剩幾日先出「預備提醒」（> 呢個數就靜默）。
 # 默認 3：同 FridayDev watchdog 嘅 urgent 門檻（≤3 日）一致。
-WATCHDOG_ALERT_DAYS = int(os.environ.get('ORIHOST_ALERT_DAYS') or "3")
+WATCHDOG_ALERT_DAYS = int(os.environ.get('ORIHOST_WATCH_DAYS') or os.environ.get('ORIHOST_ALERT_DAYS') or "3")
 
 # remember_web cookie 名（bundle.json 12:59 录制快照实测）
 REMEMBER_COOKIE_NAME = "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d"
@@ -151,12 +152,12 @@ def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
 
     text = (
         f"🎉 Orihost 续期通知\n\n"
-        f"{status}\n"
-        f"👤 账号: {masked_email}\n"
-        f"📅 续期前到期：{old_due}\n"
-        f"📅 续期后到期：{new_due}\n"
-        f"🌐 续期使用IP: {current_ip}\n"
-        f"🕒 续期时间：{now}"
+        f"{html.escape(status)}\n"
+        f"👤 账号: {html.escape(masked_email)}\n"
+        f"📅 续期前到期：{html.escape(str(old_due))}\n"
+        f"📅 续期后到期：{html.escape(str(new_due))}\n"
+        f"🌐 续期使用IP: {html.escape(str(current_ip))}\n"
+        f"🕒 续期时间：{html.escape(now)}"
     )
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}

@@ -132,7 +132,8 @@ def _parse_full_cookie(cookie_str: str) -> dict:
 def load_accounts():
     """支持多账号：ORIHOST_REMEMBER_N / ORIHOST_COOKIE_N + ORIHOST_SERVER_IDS_N，向下兼容单账号写法"""
     accounts = []
-    for i in range(1, 20):
+    i = 1
+    while True:
         token_raw = (
             os.environ.get(f"ORIHOST_REMEMBER_{i}")
             or os.environ.get(f"ORIHOST_COOKIE_{i}")
@@ -140,18 +141,15 @@ def load_accounts():
         ).strip()
         ids_raw = os.environ.get(f"ORIHOST_SERVER_IDS_{i}") or ""
         if not token_raw and not ids_raw:
-            continue
+            break
         ids = _split_ids(ids_raw)
         if not token_raw:
             print(f"⚠️ 账号{i} token 为空，跳过")
-            continue
-        if not ids:
+        elif not ids:
             print(f"⚠️ 账号{i} ORIHOST_SERVER_IDS_{i} 为空，跳过")
-            continue
-        accounts.append({"label": f"账号{i}", "auth": token_raw, "servers": ids})
-        if not os.environ.get(f"ORIHOST_REMEMBER_{i+1}") and not os.environ.get(f"ORIHOST_COOKIE_{i+1}"):
-            # 允许空洞后面还有？继续扫完 19 个，不提前 break 以免漏 _3
-            pass
+        else:
+            accounts.append({"label": f"账号{i}", "auth": token_raw, "servers": ids})
+        i += 1
 
     if not accounts:
         # 单账号兼容：ORIHOST_REMEMBER / ORI_COOKIE(yanyumm1) / ORIHOST_COOKIE
@@ -210,10 +208,7 @@ def make_session(auth_raw: str):
     for _ in range(5):
         try:
             kw = {"timeout": 20}
-            if HAS_CFFI:
-                r = s.get(f"{PANEL}/dashboard", **kw)
-            else:
-                r = s.get(f"{PANEL}/dashboard", **kw)
+            r = s.get(f"{PANEL}/dashboard", **kw)
             xsrf = None
             try:
                 xsrf = s.cookies.get("XSRF-TOKEN")

@@ -1,3 +1,5 @@
 curl_cffi>=0.7
 requests>=2.31
+playwright>=1.40
+# seleniumbase 仅 orihost_browser_renew.py（旧脚本）使用；app.py 已迁移到 playwright
 seleniumbase>=4.0
