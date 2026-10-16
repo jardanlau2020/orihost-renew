@@ -133,6 +133,30 @@ def get_current_ip(proxy_server=None):
         return "获取失败"
 
 
+def _mark_notified():
+    """通知已成功發出 → 寫 `RENEW_NOTIFIED=1` 落 $GITHUB_ENV。
+
+    renew-kit 嘅「Fallback Telegram notice on failure」係**兜底**（腳本死得無聲時才發），
+    但佢唔知腳本其實已經自行通知過 —— 結果每次 watchdog 特意標紅（窗口開／需人手）
+    都會多發一條誤導訊息「🚨 … 续期脚本异常退出」。
+    實證 run 38915537808（2026-10-16）：腳本明明已發「🔔 已進入續期窗口，請人手撳」，
+    用戶仍然收到「脚本异常退出」→ 以為程式爆咗。
+
+    有咗呢個 flag，renew-kit 兜底就會靜默，只保留真正「死得無聲」嗰種情況。
+    """
+    if os.environ.get("RENEW_NOTIFIED") == "1":
+        return
+    path = os.environ.get("GITHUB_ENV")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("RENEW_NOTIFIED=1\n")
+        os.environ["RENEW_NOTIFIED"] = "1"
+    except Exception as e:
+        log(f"⚠️ 寫 RENEW_NOTIFIED 失敗（唔影響通知）: {str(e)[:80]}")
+
+
 def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
     """发送 Telegram 通知（对齐 eooce/Auto-Renew-HidenCloud 风格）"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
@@ -167,6 +191,7 @@ def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
         resp = requests.post(url, json=payload, timeout=10, proxies=REQUESTS_PROXIES)
         if resp.status_code == 200:
             log("✅ Telegram 通知发送成功")
+            _mark_notified()   # 令 renew-kit 兜底靜默，避免「脚本异常退出」誤導訊息
             return True
         log(f"❌ Telegram 通知失败: {resp.text[:200]}")
         return False
