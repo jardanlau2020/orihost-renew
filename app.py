@@ -615,6 +615,61 @@ def watchdog_check(page):
     return True, "Renew 掣可撳 + 無冷卻 → 窗口開咗"
 
 
+
+# ── 2026-11-05 新增：接口續期（繞過 Turnstile）───────────────────────────
+# 來源：gxjxzhoo/auto-renew-orihost（參考 JJJuines/orihost-renew）
+# 發現「Read article」其實只係伺服器計時：POST renew/begin 會回 dwell_seconds，
+# 等夠鐘再 GET renewal/complete 就完成續期 —— 全程同源 fetch + XSRF cookie，
+# **唔需要開文章、亦唔需要過 Turnstile**。
+# 我哋原本 8/8 全敗係死在頁面點擊流程，唔係死在權限。
+API_RENEW_JS = """
+async ([method, path, body]) => {
+  const m = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
+  const h = {"Accept":"application/json","Content-Type":"application/json","X-Requested-With":"XMLHttpRequest"};
+  if (m) h["X-XSRF-TOKEN"] = decodeURIComponent(m[1]);
+  const r = await fetch(path, {method, headers: h, credentials: "same-origin",
+                               body: body ? JSON.stringify(body) : undefined});
+  return {status: r.status, text: await r.text()};
+}
+"""
+
+
+def panel_api(page, method, path, body=None):
+    """用已登入頁面嘅同源 fetch 打面板 client API（自動帶 XSRF）。"""
+    try:
+        return page.evaluate(API_RENEW_JS, [method, path, body])
+    except Exception as e:
+        log(f"   ⚠️ panel_api 異常（{type(e).__name__}）: {str(e)[:120]}")
+        return None
+
+
+def api_renew(page, sid):
+    """接口續期：renew/begin → 等 dwell → renewal/complete。
+    成功回傳 True；任何失敗回傳 None（交返 watchdog 提醒／頁面流程）。"""
+    r = panel_api(page, "POST", f"/api/client/servers/{sid}/renew/begin")
+    st = (r or {}).get("status")
+    if st != 200:
+        log(f"   ⚠️ 接口 renew/begin 回 {st}：{str((r or {}).get('text',''))[:140]}")
+        return None
+    dwell = 15
+    try:
+        dwell = int(json.loads((r or {}).get("text") or "{}").get("dwell_seconds") or 15)
+    except Exception:
+        pass
+    log(f"   ↻ 接口續期已開始，等 {dwell + 2}s（模擬讀文章）")
+    time.sleep(min(dwell, 120) + 2)
+    r2 = panel_api(page, "GET", "/api/client/renewal/complete")
+    try:
+        d = json.loads((r2 or {}).get("text") or "{}")
+    except Exception:
+        d = {}
+    _st2 = (r2 or {}).get("status")
+    log(f"   ↻ renewal/complete 回 {_st2}，renewed={d.get('renewed_count')} skipped={d.get('skipped_count')}")
+    if (r2 or {}).get("status") == 200 and (d.get("renewed_count") or 0) > 0:
+        return True
+    return None
+
+
 def renew_service(page):
     """Orihost 续期芯：Renew → Read Article（新标签 dwell）→ Turnstile → Claim Renewal
     返回 True / False / "NOT_TIME"（冷却中或未到续期条件）"""
@@ -1041,6 +1096,15 @@ def main():
                                                old_due, old_due, current_ip)
                     sys.exit(0)
                 if window_open:
+                    # 2026-11-05：窗口開 → 先試「接口續期」（唔使 Turnstile）
+                    log("🔓 窗口開咗 → 試接口續期（繞過 Turnstile）")
+                    if api_renew(page, SERVER_SHORT_ID):
+                        new_days = get_renewal_days(page)
+                        new_due = f"剩余 {new_days} 天" if new_days is not None else "已續期"
+                        log(f"✅ 接口續期成功：{old_due} → {new_due}")
+                        send_telegram_notification("✅ 接口續期成功（免人手）", old_due, new_due, current_ip)
+                        sys.exit(0)
+                    log("⚠️ 接口續期未成功 → 退回 watchdog 提醒（要人手撳）")
                     log("🔔【可續期窗口已開】watchdog 模式唔會自動撳，已 TG 提醒人手")
                     send_telegram_notification(
                         "🔔 已進入續期窗口，請人手撳（watchdog 模式唔會自動撳）",
