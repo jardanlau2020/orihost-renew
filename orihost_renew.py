@@ -636,7 +636,7 @@ def read_article(sb, sid, main):
 # 真实路径是接口：renew/begin(200) → 过 Turnstile 拿 token → renewal/complete
 # 带上 ?cf-turnstile-response=<token>。所以接口续期默认开启。
 # 临时要退回页面流程（排查用）：API_RENEW=0。
-API_RENEW = os.getenv("API_RENEW", "0").strip().lower() in ("1", "true", "yes")
+API_RENEW = os.getenv("API_RENEW", "1").strip().lower() not in ("0", "false", "no", "")
 
 
 def api_renew(sb, sid, url, before):
