@@ -42,7 +42,9 @@ jobs:
           sudo apt-get update -y
           # SeleniumBase 的 uc 模式用 headless=False + 外部 Xvfb，缺 Xvfb 或图形库
           # 就会「driver 连接 localhost:port 被拒」，所以这里一次装齐。
-          sudo apt-get install -y xvfb xvfb-run x11-utils libgbm1 libasound2t64 fonts-noto-cjk
+          # 注意：xvfb-run 不是独立 apt 包，它随 xvfb 一起装（run #78 踩过：
+          # E: Unable to locate package xvfb-run）。
+          sudo apt-get install -y xvfb x11-utils libgbm1 libasound2t64 fonts-noto-cjk
           # 不许静默失败：run #73 这步日志是空的，Xvfb 到底装没装没人知道
           which Xvfb || { echo "❌ Xvfb 没装上"; exit 1; }
           which xvfb-run || { echo "❌ xvfb-run 没装上"; exit 1; }
