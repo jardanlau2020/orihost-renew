@@ -162,12 +162,26 @@ def main(argv=None) -> int:
     ap.add_argument("src")
     ap.add_argument("dst", nargs="?")
     ap.add_argument("--check", action="store_true", help="只报告，不写文件")
+    ap.add_argument(
+        "--in-place", action="store_true",
+        help="明确允许原地覆盖 src（不指定 dst 时必须带这个，防手滑）",
+    )
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument(
         "--allow-loss", action="store_true",
         help="住宅节点全丢时仍然 exit 0（默认 exit 2，避免 workflow 误判成功）",
     )
     args = ap.parse_args(argv)
+
+    # 2026-11-21（冷王 review）：原来 dst 缺省就原地覆盖 src，workflow 一旦
+    # 不带 dst 调用，会把住宅节点从订阅文件里真删掉。改成必须显式表态。
+    if not args.check and not args.dst and not args.in_place:
+        print(
+            "[filter] ❌ 未指定输出文件。要原地覆盖请显式加 --in-place，"
+            "否则请给第二个参数作为输出路径（推荐，保留原文件）。",
+            file=sys.stderr,
+        )
+        return 1
 
     try:
         with open(args.src, encoding="utf-8") as f:
@@ -198,7 +212,6 @@ def main(argv=None) -> int:
         with open(dst, "w", encoding="utf-8") as f:
             yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False, width=100000)
         print(f"[filter] ✅ 已写入 {dst}")
-
     if residential_lost:
         print(
             f"[filter] ❌ 住宅节点全部被丢弃（{len(home_dropped)} 个），"
