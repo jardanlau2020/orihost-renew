@@ -134,8 +134,10 @@ jobs:
           python scripts/openvpn_egress.py --config home_sub.yaml \
             ${REGION:+--region "$REGION"} --out /tmp/node.ovpn
 
-          # 强制接管默认路由：没有这行，curl 还是走原网卡，会误判节点失败
-          echo 'redirect-gateway def1' >> /tmp/node.ovpn
+          # 不再手动加 redirect-gateway：服务端 PUSH_REPLY 已经带了
+          # `redirect-gateway def1`（run 44889632574 日志可见），重复指定
+          # 只会让 openvpn 报 "specified redirect-gateway and redirect-private
+          # at the same time"，无害但会误导排障。
           sudo openvpn --config /tmp/node.ovpn --daemon --log /tmp/ovpn.log
 
           for i in $(seq 1 20); do
