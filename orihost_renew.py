@@ -659,6 +659,22 @@ def api_renew(sb, sid, url, before):
         return None
 
 
+def dump_buttons(sb, tag=""):
+    """打印页面所有 button 的文案与 class。
+
+    2026-11-21 run #88：renew/begin 接口成功了，但页面上找不到 Claim Renewal。
+    按钮文案/选择器可能被面板改过，靠这份清单定位，不靠猜。
+    """
+    try:
+        btns = sb.execute_script(
+            "return Array.from(document.querySelectorAll('button')).map("
+            "function(b){return {t:(b.textContent||'').trim().slice(0,40),"
+            "c:(b.className||'').toString().slice(0,60)}})")
+        log(f"🔎 按钮清单{f'[{tag}]' if tag else ''}：{btns}")
+    except Exception as e:
+        log(f"🔎 读按钮清单失败：{type(e).__name__}: {e}")
+
+
 def renew(sb, url):
     sid = url.rsplit("/", 1)[-1]
     try:
@@ -702,6 +718,7 @@ def renew(sb, url):
                 txt = "?"
             if "CSRF token mismatch" in txt:
                 raise RuntimeError("CSRF token mismatch")
+            dump_buttons(sb, f"第{i + 1}次")
             log(f"{sid}: 第 {i + 1} 次阅读后没出现 Claim Renewal（弹窗：{txt}），重试")
             sb.save_screenshot(f"fail_{sid}_read{i + 1}.png")
             close_extra_tabs(sb, main)
