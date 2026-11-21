@@ -164,6 +164,19 @@ jobs:
           fi
           echo "✅ openvpn 住宅出口可用：$DIRECT_IP → $PROXY_IP"
 
+          # 2026-11-21：出口 IP 变了只证明「流量从隧道出」，不证明「能到目标站」。
+          # 接线之前先确认隧道里能不能连上 orihost 面板，否则接进去也是白跑。
+          echo "--- 通过隧道访问目标站 ---"
+          for U in "https://panel.orihost.com/auth/login" "https://api.ipify.org"; do
+            CODE="$(curl -s --interface "$TUN_IF" -o /dev/null -w '%{http_code}' \
+                    --max-time 20 "$U" || echo '000')"
+            echo "   [$TUN_IF] $U → HTTP $CODE"
+            if [ "$CODE" = "000" ]; then
+              echo "❌ 隧道里连不上 $U"; exit 1
+            fi
+          done
+          echo "✅ 隧道内目标站可达"
+
       - name: 收隧道
         if: always()
         run: |
