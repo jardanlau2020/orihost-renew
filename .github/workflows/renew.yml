@@ -1,4 +1,4 @@
-﻿name: Orihost 自动续期
+name: Orihost 自动续期
 
 on:
   schedule:
@@ -143,9 +143,12 @@ jobs:
           ORIHOST_PASSWORD: ${{ secrets.ORIHOST_PASSWORD }}
           ORIHOST_COOKIE: ${{ secrets.ORIHOST_COOKIE }}
           ORIHOST_REMEMBER: ${{ secrets.ORIHOST_REMEMBER }}
-          # 2026-11-21: 面板改版后 renewal/complete 需要 cf-turnstile-response，
-          # 无 token 必回 400。关掉接口捷径，强制走页面流程（那里有 pass_turnstile）。
-          API_RENEW: "1"   # 面板 bundle 无 Read Article/Claim Renewal，只能走接口 + Turnstile token
+          # 2026-11-21: renewal/complete 要 cf-turnstile-response，而该 token 只能由
+          # 「点开续期弹窗 -> Read article -> widget 渲染」产生，接口路径拿不到，
+          # 所以接口那段每轮会白烧约 2 分钟。
+          # 但 renew/begin 可能打开了续期窗口期，唯一一轮成功样本（run 44894132904）
+          # 无法排除这一点，故暂时保持 1；等 11-24 09:07 cron 再跑一轮后决定是否关。
+          API_RENEW: "1"
           NODE_LINK: ${{ secrets.NODE_LINK }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}

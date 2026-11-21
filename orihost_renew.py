@@ -631,11 +631,18 @@ def read_article(sb, sid, main):
     kill_overlays(sb)
 
 
-# 2026-11-21：面板 bundle 里 `Read Article` / `Claim Renewal` 命中 0 次
-# （1456800 字节主包），页面点击流程是写给旧面板的，永远匹配不到。
-# 真实路径是接口：renew/begin(200) → 过 Turnstile 拿 token → renewal/complete
-# 带上 ?cf-turnstile-response=<token>。所以接口续期默认开启。
-# 临时要退回页面流程（排查用）：API_RENEW=0。
+# 2026-11-21（run 44894132904，4 天 -> 11 天，11 轮里唯一成功的一轮）：
+# 这一段原来的判断被实测推翻，按事实重写——
+#   * 面板确实有页面续期流程，不是「写给旧面板、永远匹配不到」。上游匹配不到是
+#     因为按钮文案带后缀 / 大小写不同：`Renew server`（不是 `Renew`）、
+#     `Read article`（不是 `Read Article`）。改成 contains + 大小写不敏感即可。
+#   * 真正让天数上涨的是页面流程，不是接口：那次接口 complete 即使走到
+#     token 长度=0 也回 400 "Failed to validate Turnstile data"，因为接口路径
+#     不打开续期弹窗，拿不到 cf-turnstile-response（该 token 只能由
+#     「点开弹窗 -> Read article -> widget 渲染」产生）。
+# 但接口路径暂时保持默认开启：唯一一轮成功样本里 renew/begin 跑在页面流程之前，
+# 无法排除它打开了续期窗口期。等 11-24 09:07 cron 再跑一轮（凑两轮样本）后再定，
+# 期间不要动这个开关。
 API_RENEW = os.getenv("API_RENEW", "1").strip().lower() not in ("0", "false", "no", "")
 
 
