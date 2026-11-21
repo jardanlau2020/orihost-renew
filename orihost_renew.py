@@ -1,533 +1,803 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# Orihost 免费服务器自动续期（Jexactyl 面板）
-# 核心：remember_web 长效 token 自动置换 session + XSRF，避免静态 Cookie 419/401 过期
-# 流程：POST /api/client/servers/{uuid}/renew/begin -> 等待 dwell_seconds -> GET /api/client/renewal/complete
+"""
+Orihost 免费服务器自动续期（SeleniumBase UC 模式 + uc_gui_click_captcha，同 hohai-checkin 的过盾方式）
 
+流程: 登录(优先 cookie, 失效用账号密码) -> 每台服务器 Console 页 -> Renew -> Read Article(新标签停留)
+      -> 过 Turnstile -> Claim Renewal -> 对比剩余天数 -> 导出最新 cookie
+
+环境变量:
+  ORIHOST_COOKIE    可选, 整段 Cookie 请求头, 优先使用
+  ORIHOST_EMAIL     账号(邮箱/用户名)
+  ORIHOST_PASSWORD  密码
+  NODE_LINK         可选, 代理节点(vless/vmess/trojan/ss/socks5/http), node_proxy.py 转本地代理, 失败回落直连
+  READ_SECONDS      看文章停留秒数, 默认 15
+  COOKIE_OUT        导出 cookie 文件, 默认 cookie.txt
+
+本地: pip install -r requirements.txt && python orihost_renew.py
+Linux 无桌面: SeleniumBase 会自动用 xvfb (需 apt install xvfb)
+"""
+import json
 import os
 import re
 import sys
 import time
-import random
-from datetime import datetime, timezone, timedelta
-from urllib.parse import unquote
+from datetime import datetime
 
-# 优先用 curl_cffi（Chrome 指纹，过基础盾 + 自动维持 Session），缺失时回退 requests
-try:
-    from curl_cffi import requests as http_lib
-    HAS_CFFI = True
-    SESSION_KW = {"impersonate": "chrome120"}
-except Exception:
-    import requests as http_lib
-    HAS_CFFI = False
-    SESSION_KW = {}
+from node_proxy import setup_node_proxy, probe_exit_ip
 
-try:
-    import requests as tg_lib
-except Exception:
-    tg_lib = http_lib
+BASE = "https://panel.orihost.com"
+EMAIL = os.getenv("ORIHOST_EMAIL", "")
+PASSWORD = os.getenv("ORIHOST_PASSWORD", "")
+COOKIE = os.getenv("ORIHOST_COOKIE", "").strip()
 
-PANEL = "https://panel.orihost.com"
-# yanyumm1 实测的 remember cookie 名（Jexactyl 默认前缀 remember_web_ + hash）
-DEFAULT_REMEMBER_NAME = "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d"
-
-RENEWAL_MAX = int(os.environ.get("RENEWAL_MAX") or "21")
-MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS") or "5")
-DWELL_EXTRA = int(os.environ.get("DWELL_EXTRA") or "2")
-
-# ---------- 代理 ----------
-# 优先级：ORIHOST_PROXY 显式指定 > 工作流 sing-box（IS_PROXY/PROXY_SERVER，由 NODE_LINK 节点链接转出） > 标准 HTTP(S)_PROXY
-# vless/trojan 等节点链接请填到 Secrets 的 NODE_LINK（工作流 sing-box 步骤会转成本地代理），不要填 ORIHOST_PROXY
-def _get_proxy():
-    explicit = (os.environ.get("ORIHOST_PROXY") or os.environ.get("ORIHOST_GOST_PROXY") or "").strip()
-    if explicit:
-        scheme = explicit.split("://", 1)[0].lower() if "://" in explicit else ""
-        if scheme in ("http", "https", "socks4", "socks5", "socks5h"):
-            return {"http": explicit, "https": explicit}
-        print(f"  ⚠️ ORIHOST_PROXY 格式不支持 ({scheme}://)，已忽略；节点链接请填 NODE_LINK")
-    if os.environ.get("IS_PROXY", "").lower() == "true":
-        srv = (os.environ.get("PROXY_SERVER") or "socks5://127.0.0.1:1080").strip()
-        # setup_proxy.sh 的本地代理同时监听 http 1081；http 代理对 requests/curl_cffi 兼容最好，优先用它
-        if srv.lower() in ("socks5://127.0.0.1:1080", "socks5h://127.0.0.1:1080"):
-            srv = "http://127.0.0.1:1081"
-        print(f"  🔗 使用 sing-box 代理: {srv}")
-        return {"http": srv, "https": srv}
-    for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
-        p = (os.environ.get(k) or "").strip()
-        if p:
-            return {"http": p, "https": p}
-    return None
-
-PROXIES = _get_proxy()
-
-# ---------- Telegram ----------
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""
-# 兼容 yanyumm1 的 TG_BOT="chat_id,token" 写法
-if (not TG_BOT_TOKEN or not TG_CHAT_ID) and os.environ.get("TG_BOT"):
-    try:
-        _cid, _tok = os.environ["TG_BOT"].split(",", 1)
-        TG_CHAT_ID = TG_CHAT_ID or _cid.strip()
-        TG_BOT_TOKEN = TG_BOT_TOKEN or _tok.strip()
-    except Exception:
-        pass
+# ── 本仓补丁：三级凭证解析（上游只有 EMAIL/PASSWORD 与 COOKIE 两级）──────────
+# 优先级 1: ORIHOST_EMAIL + ORIHOST_PASSWORD（上游主线）
+# 优先级 2: ORIHOST_COOKIE（整段 cookie 串）
+# 优先级 3: ORIHOST_REMEMBER（Jexactyl 的 remember_web token，裸值或整段 cookie）
+# 三个都没有时打一行明确提示，不静默失败。
+REMEMBER_RAW = os.getenv("ORIHOST_REMEMBER", "").strip()
+REMEMBER_COOKIE_NAME = "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d"
 
 
-def send_tg(msg: str):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        return
-    try:
-        tg_lib.post(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg},
-            timeout=15,
-        )
-    except Exception as e:
-        print(f"  TG 发送失败: {e}")
+def _remember_to_cookie(raw: str) -> str:
+    """把 ORIHOST_REMEMBER 归一成整段 Cookie。
+
+    兼容两种写法：
+      - 裸 token（一长串字母数字）→ 拼成 name=value
+      - 整段 Cookie（含 remember_web_xxx=）→ 原样用
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if "remember_web" in raw:
+        return raw
+    return f"{REMEMBER_COOKIE_NAME}={raw}"
 
 
-# ---------- 账号解析 ----------
-def _split_ids(raw: str):
-    return [s.strip() for s in (raw or "").replace(";", ",").split(",") if s.strip()]
+if not COOKIE and REMEMBER_RAW:
+    COOKIE = _remember_to_cookie(REMEMBER_RAW)
+
+if EMAIL and PASSWORD:
+    _cred_path = "账密（ORIHOST_EMAIL + ORIHOST_PASSWORD）"
+elif COOKIE:
+    _cred_path = ("cookie（ORIHOST_COOKIE）" if os.getenv("ORIHOST_COOKIE", "").strip()
+                  else "remember token（ORIHOST_REMEMBER）")
+else:
+    _cred_path = ""
+
+if not _cred_path:
+    print("❌ 缺凭证：需要 ORIHOST_EMAIL + ORIHOST_PASSWORD，"
+          "或 ORIHOST_COOKIE，或 ORIHOST_REMEMBER（remember_web token）其中之一", flush=True)
+
+NODE_LINK = os.getenv("NODE_LINK", "")
+READ_SECONDS = int(os.getenv("READ_SECONDS", "25"))
+COOKIE_OUT = os.getenv("COOKIE_OUT", "cookie.txt")
+
+TS_IFRAME = 'iframe[src*="challenges.cloudflare.com"]'
+MAX_DAYS = int(os.environ.get("MAX_DAYS", "21"))
+X_RENEW = "//button[normalize-space()='Renew']"
+X_READ = "//button[contains(normalize-space(),'Read Article')]"
+X_CLAIM = "//button[contains(normalize-space(),'Claim Renewal')]"
+X_SIGNIN = "//button[@type='submit' or contains(normalize-space(),'Sign In')]"
 
 
-def _detect_input_kind(value: str) -> str:
-    """判定用户填的是 裸 remember token / 完整 Cookie 串"""
-    v = (value or "").strip()
-    if not v:
-        return "empty"
-    if "remember_web" in v:
-        # 包含 remember_web 名：可能是 "name=value" 或完整 Cookie 串
-        if ";" in v or "XSRF-TOKEN" in v or "jexactyl_session" in v:
-            return "full_cookie"
-        if "=" in v:
-            return "remember_pair"
-        return "remember_raw"
-    if ";" in v and "=" in v:
-        return "full_cookie"
-    if "=" in v and len(v) < 300 and v.count("=") == 1 and ";" not in v:
-        return "remember_pair"
-    # 短纯 token（无 = 无 ;）视为裸 token
-    return "remember_raw"
+def log(*a):
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}]", *a, flush=True)
 
 
-def _parse_full_cookie(cookie_str: str) -> dict:
-    cookies = {}
-    for item in cookie_str.split(";"):
-        item = item.strip()
-        if not item or "=" not in item:
-            continue
-        k, v = item.split("=", 1)
-        k, v = k.strip(), v.strip()
-        if not k or k.lower() in ("path", "expires", "domain", "max-age", "samesite", "secure", "httponly"):
-            continue
+def credential_path() -> str:
+    """当前用的是哪条凭证路径（只报类型，不报值）。"""
+    if EMAIL and PASSWORD:
+        return "账密"
+    if os.getenv("ORIHOST_COOKIE", "").strip():
+        return "ORIHOST_COOKIE"
+    if REMEMBER_RAW:
+        return "ORIHOST_REMEMBER"
+    return "无"
+
+
+# ---------------------------------------------------------------- 网络
+
+def setup_network():
+    """返回 (本地代理URL或None, 脱敏出口IP, 模式)。代理失败回落直连。"""
+    ext = os.getenv("NODE_PROXY_URL", "").strip()
+    if ext:  # 前一步 gxjxzhoo/Node_Proxy Action 已起好代理
+        log("使用 Node_Proxy Action 提供的本地代理")
+        return ext, os.getenv("NODE_PROXY_IP", "") or "未知", "代理"
+    if NODE_LINK.strip():
         try:
-            v = unquote(v)
-        except Exception:
-            pass
-        cookies[k] = v
-    return cookies
-
-
-def load_accounts():
-    """支持多账号：ORIHOST_REMEMBER_N / ORIHOST_COOKIE_N + ORIHOST_SERVER_IDS_N，向下兼容单账号写法"""
-    accounts = []
-    i = 1
-    while True:
-        token_raw = (
-            os.environ.get(f"ORIHOST_REMEMBER_{i}")
-            or os.environ.get(f"ORIHOST_COOKIE_{i}")
-            or ""
-        ).strip()
-        ids_raw = os.environ.get(f"ORIHOST_SERVER_IDS_{i}") or ""
-        if not token_raw and not ids_raw:
-            break
-        ids = _split_ids(ids_raw)
-        if not token_raw:
-            print(f"⚠️ 账号{i} token 为空，跳过")
-        elif not ids:
-            print(f"⚠️ 账号{i} ORIHOST_SERVER_IDS_{i} 为空，跳过")
-        else:
-            accounts.append({"label": f"账号{i}", "auth": token_raw, "servers": ids})
-        i += 1
-
-    if not accounts:
-        # 单账号兼容：ORIHOST_REMEMBER / ORI_COOKIE(yanyumm1) / ORIHOST_COOKIE
-        single_auth = (
-            os.environ.get("ORIHOST_REMEMBER")
-            or os.environ.get("ORI_COOKIE")
-            or os.environ.get("ORIHOST_COOKIE")
-            or ""
-        ).strip()
-        single_ids = _split_ids(
-            os.environ.get("ORIHOST_SERVER_IDS")
-            or os.environ.get("ORIHOST_SERVER_IDS_1")
-            or ""
-        )
-        if single_auth and single_ids:
-            accounts.append({"label": "默认账号", "auth": single_auth, "servers": single_ids})
-
-    return accounts
-
-
-# ---------- 会话（remember 自动置换） ----------
-def make_session(auth_raw: str):
-    """用 remember 长效 token 置换出最新 session + XSRF，返回 (session, xsrf)"""
-    kind = _detect_input_kind(auth_raw)
-    s = http_lib.Session(**SESSION_KW) if HAS_CFFI else http_lib.Session()
-    if PROXIES:
-        try:
-            s.proxies.update(PROXIES)
-        except Exception:
-            pass
-    try:
-        s.headers.update({"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
-    except Exception:
-        pass
-
-    if kind == "full_cookie":
-        for k, v in _parse_full_cookie(auth_raw).items():
-            try:
-                s.cookies.set(k, v, domain="panel.orihost.com")
-            except Exception:
-                pass
-    elif kind == "remember_pair":
-        name, val = auth_raw.split("=", 1)
-        try:
-            s.cookies.set(name.strip(), val.strip(), domain="panel.orihost.com")
-        except Exception:
-            pass
-    else:  # remember_raw：裸 token，用默认 cookie 名
-        try:
-            s.cookies.set(DEFAULT_REMEMBER_NAME, auth_raw.strip(), domain="panel.orihost.com")
-        except Exception:
-            pass
-
-    # 访问 dashboard 触发服务端签发新 session + XSRF，最多试 5 次
-    last_err = None
-    for _ in range(5):
-        try:
-            kw = {"timeout": 20}
-            r = s.get(f"{PANEL}/dashboard", **kw)
-            xsrf = None
-            try:
-                xsrf = s.cookies.get("XSRF-TOKEN")
-            except Exception:
-                xsrf = None
-            if xsrf:
-                return s, unquote(xsrf)
-            # 有些版本 Set-Cookie 在响应头里但 jar 没收录，兜底从响应解析
-            try:
-                m = re.search(r"XSRF-TOKEN=([^;]+)", r.headers.get("Set-Cookie", "") or "")
-                if m:
-                    return s, unquote(m.group(1))
-            except Exception:
-                pass
-            time.sleep(2)
+            proxy, ip, _ = setup_node_proxy(NODE_LINK, workdir=os.getenv("RUNNER_TEMP", "/tmp"))
+            return proxy, ip or "未知", "代理"
         except Exception as e:
-            last_err = e
-            time.sleep(2)
-    raise RuntimeError(f"置换 session 失败（remember 可能失效）：{last_err}")
+            log("代理启动失败，回落直连：", e)
+            return None, probe_exit_ip() or "未知", "直连(代理失败)"
+    return None, probe_exit_ip() or "未知", "直连"
 
 
-def refresh_xsrf(s):
+# ---------------------------------------------------------------- Turnstile
+
+def ts_token(sb):
     try:
-        s.get(f"{PANEL}/dashboard", timeout=15)
-        xsrf = s.cookies.get("XSRF-TOKEN")
-        if xsrf:
-            return unquote(xsrf)
+        return sb.execute_script(
+            "var e=document.querySelector('input[name=\"cf-turnstile-response\"]');"
+            "return e?e.value:'';") or ""
     except Exception:
-        pass
-    return None
+        return ""
 
 
-def build_headers(xsrf: str, server_short: str) -> dict:
-    h = {
-        "Accept": "application/json",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"{PANEL}/server/{server_short}",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-    }
-    if xsrf:
-        h["X-XSRF-TOKEN"] = xsrf
-    return h
-
-
-# ---------- 业务接口 ----------
-def short_id(uuid: str) -> str:
-    return (uuid or "").strip().split("-")[0][:8]
-
-
-def api_get(s, path: str, headers: dict):
-    kw = {"headers": headers, "timeout": 20}
-    if PROXIES and not HAS_CFFI:
-        kw["proxies"] = PROXIES
-    return s.get(f"{PANEL}{path}", **kw)
-
-
-def api_post(s, path: str, headers: dict):
-    kw = {"headers": headers, "timeout": 30}
-    if PROXIES and not HAS_CFFI:
-        kw["proxies"] = PROXIES
-    return s.post(f"{PANEL}{path}", **kw)
-
-
-def get_info(s, headers, server_uuid: str):
-    """查剩余续期次数与到期天数，UUID 与短 ID 双试"""
-    for ident in (server_uuid, short_id(server_uuid)):
-        try:
-            r = api_get(s, f"/api/client/servers/{ident}", headers)
-            if not r.ok:
-                continue
-            attrs = r.json().get("attributes", {})
-            renewal = attrs.get("renewal", 0)
-            try:
-                renewal = int(renewal)
-            except Exception:
-                renewal = 0
-            days = None
-            exp = attrs.get("expires_at")
-            if exp:
-                try:
-                    dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
-                    days = round((dt - datetime.now(timezone.utc)).total_seconds() / 86400, 1)
-                except Exception:
-                    days = None
-            return renewal, days
-        except Exception:
-            continue
-    return None, None
-
-
-def check_cooldown(s, headers, server_uuid: str) -> int:
+def btn_enabled(sb, xpath):
     try:
-        r = api_get(s, f"/api/client/servers/{server_uuid}/renew/cooldown", headers)
-        if r.ok:
-            return int(r.json().get("seconds", 0) or 0)
-    except Exception:
-        pass
-    return 0
-
-
-def _page_says_limit_reached(s, server_uuid: str) -> bool:
-    """面板在已达续期上限时 complete 直接报 500，用服务器页面文案二次确认"""
-    try:
-        r = s.get(f"{PANEL}/server/{short_id(server_uuid)}", timeout=20)
-        return r.ok and "Renew Limit Reached" in (r.text or "")
+        el = sb.find_element(xpath, by="xpath", timeout=1)
+        return el.is_enabled() and el.get_attribute("disabled") is None
     except Exception:
         return False
 
 
-def do_renew_once(s, headers, server_uuid: str) -> dict:
-    # 冷却等待（超过 5 分钟则本轮放弃，避免 Actions 超时）
-    cd = check_cooldown(s, headers, server_uuid)
-    if cd > 0:
-        if cd > 300:
-            return {"status": "cooldown", "message": f"冷却中 {cd}s，本轮跳过"}
-        print(f"  ⏳ 冷却 {cd}s")
-        time.sleep(cd + 1)
+RESET_TS_JS = """
+try { if (window.turnstile) { document.querySelectorAll('.cf-turnstile, [data-sitekey]').forEach(function(w){ try{turnstile.reset(w);}catch(e){} }); try{turnstile.reset();}catch(e){} return 1; } } catch(e) {}
+return 0;
+"""
 
+
+def rerender_detached(sb, secs=8):
+    """弹窗里的 Turnstile 是在 webdriver 连接状态下渲染的, CF 会识别。
+    重置 widget 后立刻断开 webdriver, 让它在"干净"状态下重新渲染。"""
     try:
-        r = api_post(s, f"/api/client/servers/{server_uuid}/renew/begin", headers)
-    except Exception as e:
-        return {"status": "error", "message": f"begin 请求失败: {e}"}
-
-    if r.status_code == 404 and short_id(server_uuid) != server_uuid:
-        # 面板路由用 8 位短 ID，完整 UUID 404 时用短 ID 重试一次
-        print("  🔁 begin 404，用短 ID 重试...")
-        try:
-            r = api_post(s, f"/api/client/servers/{short_id(server_uuid)}/renew/begin", headers)
-        except Exception as e:
-            return {"status": "error", "message": f"begin 请求失败: {e}"}
-
-    if r.status_code == 419:
-        return {"status": "reauth", "message": "419 CSRF 过期，需刷新 session"}
-    if r.status_code == 401:
-        return {"status": "reauth", "message": "401 未认证，需刷新 session"}
-    if not r.ok:
-        return {"status": "error", "message": f"begin HTTP {r.status_code}: {r.text[:150]}"}
-    try:
-        data = r.json()
+        n = sb.execute_script(RESET_TS_JS)
     except Exception:
-        return {"status": "error", "message": f"begin 解析失败: {r.text[:150]}"}
+        n = 0
+    try:
+        sb.reconnect(secs)
+    except Exception:
+        sb.sleep(secs)
+    return n
 
-    ad_url = data.get("url") or ""
-    wait = int(data.get("dwell_seconds") or 15)
-    print(f"  📰 广告已获取，模拟阅读 {wait}s")
-    if ad_url:
-        try:
-            s.get(ad_url, timeout=20)
-        except Exception:
-            pass
-    time.sleep(wait + DWELL_EXTRA + random.randint(1, 3))
 
-    last_detail = "无响应"
-    for attempt in range(1, 4):
-        try:
-            r2 = api_get(s, "/api/client/renewal/complete", headers)
-        except Exception as e:
-            last_detail = f"第 {attempt} 次请求异常: {e}"
-            print(f"  ⚠️ complete {last_detail}")
-            time.sleep(2)
-            continue
-        body = (r2.text or "")[:200]
-        print(f"  📥 complete 第 {attempt} 次 HTTP {r2.status_code}: {body}")
-        last_detail = f"HTTP {r2.status_code}: {body}"
-        if r2.status_code in (401, 419):
-            return {"status": "reauth", "message": f"complete {r2.status_code}，需刷新 session"}
-        if r2.status_code == 500 and _page_says_limit_reached(s, server_uuid):
-            return {"status": "skipped", "message": "已达续期上限（面板显示 Renew Limit Reached）"}
-        if r2.status_code in (200, 204):
+MARK_TS_JS = """
+var inp=document.querySelector('input[name="cf-turnstile-response"]');
+var el=inp?inp.parentElement:null;
+while(el && el!==document.body && (el.offsetWidth<250 || el.offsetHeight<50)) el=el.parentElement;
+if(!el || el===document.body){
+  var f=document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+  el=f||null;
+}
+if(!el) return null;
+el.scrollIntoView({block:'center'});
+el.setAttribute('data-hark-ts','1');
+var r=el.getBoundingClientRect();
+return [r.left, r.top, r.width, r.height];
+"""
+
+
+def click_turnstile_box(sb):
+    """自己算复选框的屏幕坐标再用系统鼠标点（uc_gui_click_captcha 在 SPA 弹窗里会选错元素）。"""
+    rect = sb.execute_script(MARK_TS_JS)
+    if not rect:
+        log("没找到 Turnstile 容器，退回 uc_gui_click_captcha")
+        sb.uc_gui_click_captcha()
+        return
+    sb.sleep(1)
+    rect = sb.execute_script(
+        "var r=document.querySelector('[data-hark-ts]').getBoundingClientRect();"
+        "return [r.left,r.top,r.width,r.height];")
+    w = sb.driver.get_window_rect()
+    inner_h = sb.execute_script("return window.innerHeight;")
+    x = w["x"] + rect[0] + 30
+    y = w["y"] + w["height"] - inner_h + rect[1] + rect[3] / 2.0
+    log(f"Turnstile 容器 {[int(v) for v in rect]}，点击屏幕坐标 ({int(x)}, {int(y)})")
+    sb.uc_gui_click_x_y(x, y)
+
+
+def pass_turnstile(sb, wait_btn_xpath, timeout=90, detach=False):
+    """系统级鼠标点 Turnstile，直到目标按钮可点或拿到 token。
+    detach=True: 用于页面内动态弹出的 Turnstile, 先断开 webdriver 重新渲染再点。"""
+    end = time.time() + 20
+    while time.time() < end and not sb.is_element_present(TS_IFRAME):
+        sb.sleep(1)
+    sb.sleep(3)
+    start, clicks = time.time(), 0
+    while time.time() - start < timeout:
+        if btn_enabled(sb, wait_btn_xpath) or ts_token(sb):
+            log(f"Turnstile 已通过（点击 {clicks} 次）")
+            return True
+        if clicks < 4 and (clicks == 0 or time.time() - start > clicks * 20):
+            if detach and clicks >= 2:
+                rerender_detached(sb)
             try:
-                res = r2.json() if r2.text else {}
-            except Exception:
-                res = {}
-            renewed = int(res.get("renewed_count", 0) or 0)
-            skipped = int(res.get("skipped_count", 0) or 0)
-            if renewed > 0:
-                return {"status": "success", "message": f"续期成功 (+{renewed})"}
-            if skipped > 0:
-                return {"status": "skipped", "message": "已达本周期续期上限"}
-            return {"status": "unknown", "message": f"未预期响应: {str(res)[:150]}"}
-        # 其他错误刷新 XSRF 重试
-        new_xsrf = refresh_xsrf(s)
-        if new_xsrf:
-            headers["X-XSRF-TOKEN"] = new_xsrf
-        time.sleep(2)
-    return {"status": "error", "message": f"complete 失败（3 次重试，最后响应 {last_detail}）"}
-
-
-def renew_server_loop(s, xsrf: str, server_uuid: str) -> dict:
-    sid = short_id(server_uuid)
-    headers = build_headers(xsrf, sid)
-    renewal, days = get_info(s, headers, server_uuid)
-    print(f"  📅 当前续期: {renewal} / 剩余 {days} 天")
-    if renewal is not None and renewal >= RENEWAL_MAX:
-        return {"status": "⏭️ 已满", "message": f"续期 {renewal}/{RENEWAL_MAX} 已满", "renewal": renewal, "days": days}
-
-    count = 0
-    last_msg = ""
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        print(f"  🔄 [{sid}] 第 {attempt}/{MAX_ATTEMPTS} 次续期...")
-        res = do_renew_once(s, headers, server_uuid)
-        if res["status"] == "reauth":
-            # remember 自动置换：重新访问 dashboard 拿新 XSRF 后重试本轮
-            print("  🔑 session 过期，自动置换中...")
-            new_xsrf = refresh_xsrf(s)
-            if not new_xsrf:
-                return {"status": "❌ 续期失败", "message": "session 刷新失败，remember 可能失效", "renewal": renewal, "days": days}
-            headers["X-XSRF-TOKEN"] = new_xsrf
-            res = do_renew_once(s, headers, server_uuid)
-        if res["status"] == "success":
-            count += 1
-            last_msg = res["message"]
-            time.sleep(random.randint(3, 7))
-            renewal, days = get_info(s, headers, server_uuid)
-            print(f"  ➡️ 续期后: {renewal} / {days} 天")
-            if renewal is not None and renewal >= RENEWAL_MAX:
-                break
-            continue
-        if res["status"] in ("skipped", "cooldown"):
-            last_msg = res["message"]
-            break
-        last_msg = res["message"]
-        print(f"  ❌ {last_msg}")
-        break
-
-    if count > 0:
-        return {"status": "✅ 续期成功", "message": f"{last_msg}（本轮 +{count}）", "renewal": renewal, "days": days}
-    if "上限" in last_msg or "冷却" in last_msg:
-        return {"status": "⏭️ 跳过", "message": last_msg, "renewal": renewal, "days": days}
-    return {"status": "❌ 续期失败", "message": last_msg or "未知错误", "renewal": renewal, "days": days}
-
-
-def now_local():
-    """北京时间 (UTC+8)，格式 MM-DD HH:MM（runner 係 UTC）"""
-    return time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
-
-
-def _short(text, limit=60):
-    """压平换行 + 截短"""
-    s = " ".join((text or "").split())
-    return s if len(s) <= limit else s[:limit - 1] + "…"
-
-
-def fmt_msg(status, label, server_uuid, detail, renewal=None, days=None):
-    """方案 B (極致精簡人話版): 每台精準兩行，徹底消滅頂部計數器"""
-    s = (status or "").strip()
-    name = f"{label}/{short_id(server_uuid)}"
-    reason = _short(detail)
-    if "成功" in s or s.startswith("✅"):
-        rem_str = f"（剩 {days} 天）" if days is not None else ""
-        l1 = f"✅ {name} · 成功續期{rem_str}"
-        l2 = "ℹ️ 服務已自動展期"
-        return f"{l1}\n{l2}"
-    elif "跳过" in s or "已满" in s or s.startswith("⏭️"):
-        rem_str = f"（剩 {days} 天）" if days is not None else ""
-        l1 = f"🟢 {name} · 狀態良好{rem_str}"
-        info_part = f"{reason} · " if reason else ""
-        l2 = f"ℹ️ {info_part}未到續期窗口"
-        return f"{l1}\n{l2}"
-    else:
-        rem_str = f"（剩 {days} 天）" if days is not None else ""
-        l1 = f"🚨 {name} · 續期未完成{rem_str}"
-        err = reason or s.strip("❌⚠️ ") or "執行失敗"
-        l2 = f"⚠️ {err} · 請登入面板手動處理"
-        return f"{l1}\n{l2}"
-
-
-def main():
-    print("=" * 42)
-    print(f" Orihost 自动续期（curl_cffi={'开' if HAS_CFFI else '关/回退requests'}，代理={'开' if PROXIES else '关'}）")
-    print("=" * 42)
-    accounts = load_accounts()
-    if not accounts:
-        print("❌ 未配置账号。请设置 ORIHOST_REMEMBER + ORIHOST_SERVER_IDS，或 ORIHOST_REMEMBER_1 + ORIHOST_SERVER_IDS_1 ...")
-        sys.exit(1)
-    print(f"📋 {len(accounts)} 个账号")
-    results = []
-    for acc in accounts:
-        label = acc["label"]
-        print(f"\n{'=' * 42}\n {label}：{len(acc['servers'])} 台\n{'=' * 42}")
-        try:
-            s, xsrf = make_session(acc["auth"])
-            print("  🔑 session 置换成功")
-        except Exception as e:
-            print(f"  ❌ 登录失败: {e}")
-            for sv in acc["servers"]:
-                info = {"label": label, "server": sv, "status": "❌ 登录失败", "message": str(e)[:120]}
-                results.append(info)
-                send_tg(fmt_msg(info["status"], label, sv, info["message"]))
-            continue
-        for sv in acc["servers"]:
-            print(f"\n  🖥 [{short_id(sv)}] ...")
-            try:
-                r = renew_server_loop(s, xsrf, sv)
-                # 同一 session 下 XSRF 可能滚动，同步最新
-                new_xsrf = None
+                if detach:
+                    click_turnstile_box(sb)
+                else:
+                    sb.uc_gui_click_captcha()
+            except Exception as e:
+                log("uc_gui_click_captcha 异常：", str(e).splitlines()[0][:200])
+            clicks += 1
+            if detach and clicks == 1:
+                sb.sleep(4)
                 try:
-                    new_xsrf = s.cookies.get("XSRF-TOKEN")
-                    if new_xsrf:
-                        xsrf = unquote(new_xsrf)
+                    sb.save_screenshot('fail_ts_after_click.png')
                 except Exception:
                     pass
-            except Exception as e:
-                r = {"status": "❌ 续期失败", "message": str(e)[:120]}
-            info = {"label": label, "server": sv, "status": r["status"], "message": r.get("message", "")}
-            results.append(info)
-            send_tg(fmt_msg(info["status"], label, sv, info["message"], r.get("renewal"), r.get("days")))
-            time.sleep(random.randint(2, 5))
+        sb.sleep(2)
+    return False
 
-    ok = sum(1 for r in results if "成功" in r["status"])
-    skip = sum(1 for r in results if "跳过" in r["status"] or "已满" in r["status"])
-    fail = len(results) - ok - skip
-    print(f"\n{'=' * 42}\n📊 汇总：{ok} 成功 / {skip} 跳过 / {fail} 失败，共 {len(results)} 台\n{'=' * 42}")
-    if fail:
-        sys.exit(2)
+
+# ---------------------------------------------------------------- 登录 / cookie
+
+def logged_in(sb):
+    return "/auth" not in sb.get_current_url()
+
+
+def inject_cookie(sb):
+    if not COOKIE:
+        return
+    n = 0
+    for part in COOKIE.split(";"):
+        if "=" in part:
+            k, v = part.strip().split("=", 1)
+            if k.upper() == "XSRF-TOKEN":  # 旧 XSRF 会和面板新下发的重复 -> CSRF token mismatch, 让面板自己重新下发
+                continue
+            try:
+                sb.driver.add_cookie({"name": k, "value": v, "domain": "panel.orihost.com",
+                                      "path": "/", "secure": True})
+                n += 1
+            except Exception as e:
+                log(f"cookie {k} 注入失败：{e}")
+    log(f"已注入 {n} 个 cookie")
+
+
+def save_cookies(sb):
+    jar = [c for c in sb.driver.get_cookies() if "orihost.com" in c.get("domain", "")]
+    if not jar:
+        return
+    header = "; ".join(f"{c['name']}={c['value']}" for c in jar)
+    if os.getenv("GITHUB_ACTIONS"):
+        for c in jar:
+            if len(c["value"]) > 6:
+                print(f"::add-mask::{c['value']}", flush=True)
+    fd = os.open(COOKIE_OUT, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(header)
+    log(f"已导出 {len(jar)} 个 cookie" + (" (未变化)" if header == COOKIE else ""))
+
+
+def login(sb):
+    sb.uc_open_with_reconnect(BASE + "/", 4)
+    sb.sleep(3)
+    if COOKIE:
+        inject_cookie(sb)
+        sb.uc_open_with_reconnect(BASE + "/", 3)
+        sb.sleep(4)
+        if logged_in(sb):
+            log("Cookie 登录成功")
+            return
+        log("Cookie 已失效，改用账号密码登录")
+    elif logged_in(sb):
+        log("已是登录状态")
+        return
+
+    if not (EMAIL and PASSWORD):
+        raise RuntimeError("未登录且没有设置 ORIHOST_EMAIL / ORIHOST_PASSWORD")
+    sb.uc_open_with_reconnect(BASE + "/auth/login", 4)
+    sb.wait_for_element('input[type="password"]', timeout=40)
+    try:
+        sb.click("//button[normalize-space()='Got it']", by="xpath", timeout=2)
+    except Exception:
+        pass
+    user_sel = ('form input:not([type="password"]):not([type="hidden"])'
+                ':not([type="checkbox"]):not([type="submit"])')
+    sb.type(user_sel, EMAIL)
+    sb.type('input[type="password"]', PASSWORD)
+    if not pass_turnstile(sb, X_SIGNIN):
+        sb.save_screenshot("fail_login.png")
+        raise RuntimeError("登录页 Turnstile 未通过")
+    sb.click(X_SIGNIN, by="xpath")
+    end = time.time() + 40
+    while time.time() < end and not logged_in(sb):
+        sb.sleep(1)
+    if not logged_in(sb):
+        sb.save_screenshot("fail_login.png")
+        raise RuntimeError("账号密码登录失败（仍停在 /auth）")
+    log("账号密码登录成功")
+
+
+# ---------------------------------------------------------------- 续期
+
+KILL_OVERLAY_JS = """
+var n=0;
+document.querySelectorAll('iframe,div,ins').forEach(function(e){
+  var src=(e.src||'')+'';
+  if(src.indexOf('challenges.cloudflare.com')>=0) return;
+  if(e.querySelector && e.querySelector('iframe[src*="challenges.cloudflare.com"]')) return;
+  var st=getComputedStyle(e);
+  if(st.position==='fixed' && parseInt(st.zIndex||'0')>=2147483000){e.remove();n++;}
+});
+return n;
+"""
+
+
+COOKIE_JS = r"""
+var hit=null;
+document.querySelectorAll('div,section,aside').forEach(function(e){
+  if(!hit && /We use cookies/i.test(e.innerText||'') && e.querySelector('button')) hit=e;
+});
+if(!hit) return 0;
+var el=hit; while(el.parentElement && /We use cookies/i.test(el.parentElement.innerText||'') && el.parentElement.innerText.length<1500) el=el.parentElement;
+var btns=[].slice.call(el.querySelectorAll('button,a'));
+var b=btns.find(function(x){return /accept|agree|got it|understand|allow|continue|^ok/i.test((x.innerText||'').trim());})||btns[btns.length-1];
+if(b){b.click();return 1;}
+el.remove();return 2;
+"""
+
+
+def dismiss_cookie(sb):
+    """面板新增的 Cookie 同意弹窗会挡住续期弹窗 -> 点同意（找不到按钮就移除）。"""
+    try:
+        r = sb.execute_script(COOKIE_JS) or 0
+        if r:
+            log("已关闭 Cookie 同意弹窗")
+            sb.sleep(1)
+        return r
+    except Exception:
+        return 0
+
+
+def kill_overlays(sb):
+    """移除广告插页（全屏 fixed、z-index 最大的 iframe/div），保留 Turnstile。"""
+    dismiss_cookie(sb)
+    try:
+        n = sb.execute_script(KILL_OVERLAY_JS) or 0
+        if n:
+            log(f"已移除 {n} 个广告遮罩")
+        return n
+    except Exception:
+        return 0
+
+
+def close_extra_tabs(sb, main):
+    for h in list(sb.driver.window_handles):
+        if h != main:
+            try:
+                sb.driver.switch_to.window(h)
+                sb.driver.close()
+            except Exception:
+                pass
+    sb.driver.switch_to.window(main)
+
+
+def safe_click(sb, xpath, timeout=20):
+    sb.wait_for_element(xpath, by="xpath", timeout=timeout)
+    kill_overlays(sb)
+    try:
+        sb.click(xpath, by="xpath", timeout=5)
+    except Exception as e:
+        if "intercepted" not in str(e) and "not clickable" not in str(e):
+            raise
+        kill_overlays(sb)
+        sb.js_click(xpath, by="xpath")
+
+
+
+def server_urls(sb):
+    sb.uc_open_with_reconnect(BASE + "/", 3)
+    try:
+        sb.wait_for_element("a[href*='/server/']", timeout=40)
+    except Exception:
+        log("首页没找到服务器链接")
+    urls = set()
+    for a in sb.find_elements("a[href*='/server/']"):
+        m = re.search(r"/server/([0-9a-zA-Z]{8})", a.get_attribute("href") or "")
+        if m:
+            urls.add(f"{BASE}/server/{m.group(1)}")
+    return sorted(urls)
+
+
+def renewal_days(sb):
+    try:
+        txt = sb.get_text("body")
+    except Exception:
+        return None
+    m = re.search(r"renewal in\s*:?\s*(\d+)\s*day", txt, re.I)
+    return int(m.group(1)) if m else None
+
+
+API_JS = r"""
+const [method, path, body, done] = [arguments[0], arguments[1], arguments[2], arguments[arguments.length - 1]];
+const m = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
+const h = {"Accept": "application/json", "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"};
+if (m) h["X-XSRF-TOKEN"] = decodeURIComponent(m[1]);
+fetch(path, {method, headers: h, credentials: "same-origin", body: body ? JSON.stringify(body) : undefined})
+  .then(async r => done({status: r.status, text: await r.text()}))
+  .catch(e => done({status: 0, text: String(e)}));
+"""
+STATE_CN = {"running": "运行中", "offline": "已关机", "starting": "启动中", "stopping": "停止中"}
+AUTO_START_SKIP = {x.strip() for x in os.getenv("AUTO_START_SKIP", "").split(",") if x.strip()}
+AUTO_START = os.getenv("AUTO_START", "1").strip().lower() not in ("0", "false", "no", "")
+
+
+def panel_api(sb, method, path, body=None):
+    """用浏览器里已登录的会话调用面板 client API（同源 fetch，带 XSRF）。"""
+    sb.driver.set_script_timeout(20)
+    return sb.driver.execute_async_script(API_JS, method, path, body)
+
+
+def fmt_uptime(ms):
+    sec = int(ms or 0) // 1000
+    d, sec = divmod(sec, 86400)
+    h, sec = divmod(sec, 3600)
+    m = sec // 60
+    return f"{d}d {h}h {m}m" if d else f"{h}h {m}m"
+
+
+def api_state(sb, sid):
+    try:
+        r = panel_api(sb, "GET", f"/api/client/servers/{sid}/resources")
+        if r and r.get("status") == 200:
+            a = json.loads(r["text"])["attributes"]
+            up = a.get("resources", {}).get("uptime", 0)
+            return a.get("current_state"), (fmt_uptime(up) if up else None)
+        log(f"{sid}: 状态接口返回 {r.get('status') if r else None}")
+    except Exception as e:
+        log(f"{sid}: 状态接口异常 {type(e).__name__}")
+    return None, None
+
+
+def server_info(sb, sid=None):
+    """服务器状态和运行时长：优先 client API，失败再读页面。"""
+    if sid:
+        st, up = api_state(sb, sid)
+        if st:
+            return STATE_CN.get(st, st), up
+    try:
+        txt = sb.get_text("body")
+    except Exception:
+        return None, None
+    m = re.search(r"UPTIME\s*(\d+d\s*\d+h\s*\d+m|\d+h\s*\d+m(?:\s*\d+s)?|\d+m\s*\d+s|Offline)", txt, re.I)
+    if not m:
+        return None, None
+    if m.group(1).lower() == "offline":
+        return "已关机", None
+    return "运行中", m.group(1)
+
+
+def ensure_running(sb, sid, rec):
+    """关机就发开机信号，记录到报告。"""
+    st, _ = api_state(sb, sid)
+    if st != "offline" or not AUTO_START or sid in AUTO_START_SKIP:
+        return
+    r = panel_api(sb, "POST", f"/api/client/servers/{sid}/power", {"signal": "start"})
+    if r and r.get("status") in (200, 204):
+        log(f"{sid}: 已关机，已发送开机指令")
+        for _ in range(12):
+            time.sleep(5)
+            st, up = api_state(sb, sid)
+            if st in ("running", "starting"):
+                break
+        rec["status"], rec["uptime"] = STATE_CN.get(st, st), up
+        rec["started"] = st in ("running", "starting")
+        if not rec["started"]:
+            rec["start_error"] = f"开机后状态仍为 {st}"
+    else:
+        rec["started"] = False
+        rec["start_error"] = f"开机接口返回 {r.get('status') if r else None}"
+        log(f"{sid}: {rec['start_error']}")
+
+
+def open_server(sb, url):
+    sb.uc_open_with_reconnect(url, 3)
+    end = time.time() + 40
+    while time.time() < end and renewal_days(sb) is None:
+        sb.sleep(1)
+    return renewal_days(sb)
+
+
+def back_to_main(sb, main):
+    sb.driver.switch_to.window(main)
+    try:
+        sb.driver.execute_cdp_cmd("Page.bringToFront", {})
+    except Exception:
+        pass
+    try:
+        sb.execute_script("window.dispatchEvent(new Event('focus'));"
+                          "document.dispatchEvent(new Event('visibilitychange'));")
+    except Exception:
+        pass
+
+
+def read_article(sb, sid, main):
+    """点 Read Article -> 文章新标签停留 -> 回到面板（文章标签保持打开，页面要求 Keep it open）。"""
+    old = set(sb.driver.window_handles)
+    safe_click(sb, X_READ)
+    end = time.time() + 15
+    while time.time() < end and len(sb.driver.window_handles) == len(old):
+        sb.sleep(1)
+    new = [h for h in sb.driver.window_handles if h not in old]
+    if new:
+        sb.driver.switch_to.window(new[-1])
+        sb.sleep(3)
+        try:
+            log(f"{sid}: 文章页 {sb.get_current_url()[:80]}")
+        except Exception:
+            pass
+        sb.sleep(READ_SECONDS)
+    else:
+        log(f"{sid}: 没有弹出文章标签，直接等待 {READ_SECONDS}s")
+        sb.sleep(READ_SECONDS)
+    back_to_main(sb, main)
+    sb.sleep(3)
+    kill_overlays(sb)
+
+
+API_RENEW = os.getenv("API_RENEW", "1").strip().lower() not in ("0", "false", "no", "")
+
+
+def api_renew(sb, sid, url, before):
+    """接口续期（参考 JJJuines/orihost-renew）：renew/begin -> 等 dwell_seconds -> renewal/complete。
+    成功返回续期后的天数；任何异常/未生效返回 None，交给页面点击流程兜底。"""
+    try:
+        r = panel_api(sb, "POST", f"/api/client/servers/{sid}/renew/begin")
+        st = r.get("status") if r else None
+        if st != 200:
+            log(f"{sid}: 接口续期 begin 返回 {st}：{(r or {}).get('text', '')[:120]}，改用页面流程")
+            if st == 419:
+                raise RuntimeError("CSRF token mismatch")
+            return None
+        try:
+            dwell = int(json.loads(r["text"]).get("dwell_seconds") or 15)
+        except Exception:
+            dwell = 15
+        log(f"{sid}: 接口续期已开始，等待 {dwell + 2}s")
+        time.sleep(min(dwell, 120) + 2)
+        r2 = panel_api(sb, "GET", "/api/client/renewal/complete")
+        try:
+            d = json.loads(r2.get("text") or "{}")
+        except Exception:
+            d = {}
+        log(f"{sid}: complete 返回 {r2.get('status') if r2 else None}，renewed={d.get('renewed_count')} skipped={d.get('skipped_count')}")
+        if not (r2 and r2.get("status") == 200 and (d.get("renewed_count") or 0) > 0):
+            return None
+        after = open_server(sb, url)
+        log(f"{sid}: {before} 天 -> {after} 天（接口）")
+        if after is not None and (before is None or after > before or after >= MAX_DAYS):
+            return after
+        return None
+    except RuntimeError:
+        raise
+    except Exception as e:
+        log(f"{sid}: 接口续期异常 {type(e).__name__}，改用页面流程")
+        return None
+
+
+def renew(sb, url):
+    sid = url.rsplit("/", 1)[-1]
+    try:
+        before = open_server(sb, url)
+        sb.sleep(2)
+        kill_overlays(sb)
+        main = sb.driver.current_window_handle
+        # 面板续期上限约 21 天；已到上限时没有 Renew 按钮，视为无需续期
+        if not sb.is_element_visible(X_RENEW, by="xpath"):
+            sb.sleep(3)
+        limit = sb.is_element_present("//*[contains(normalize-space(),'Renew Limit Reached')]", by="xpath")
+        if limit or (not sb.is_element_visible(X_RENEW, by="xpath") and before is not None and before >= MAX_DAYS):
+            log(f"{sid}: 剩余 {before} 天，已达上限，跳过")
+            st, up = server_info(sb, sid)
+            return {"before": before, "after": before, "status": st, "uptime": up, "skipped": True}
+        if API_RENEW:
+            after = api_renew(sb, sid, url, before)
+            if after is not None:
+                st, up = server_info(sb, sid)
+                return {"before": before, "after": after, "status": st, "uptime": up, "via": "api"}
+            open_server(sb, url)
+            sb.sleep(2)
+            kill_overlays(sb)
+        safe_click(sb, X_RENEW)
+        sb.sleep(2)
+        close_extra_tabs(sb, main)
+
+        for i in range(3):  # 广告可能吃掉 Read Article 的点击, 最多点 3 次
+            read_article(sb, sid, main)
+            end = time.time() + 15
+            while time.time() < end and not sb.is_element_present(X_CLAIM, by="xpath"):
+                sb.sleep(1)
+            if sb.is_element_present(X_CLAIM, by="xpath"):
+                break
+            dismiss_cookie(sb)
+            if sb.is_element_present(X_CLAIM, by="xpath"):
+                break
+            try:
+                txt = sb.get_text("div[role='dialog'], .ReactModal__Content")[:160].replace("\n", " | ")
+            except Exception:
+                txt = "?"
+            if "CSRF token mismatch" in txt:
+                raise RuntimeError("CSRF token mismatch")
+            log(f"{sid}: 第 {i + 1} 次阅读后没出现 Claim Renewal（弹窗：{txt}），重试")
+            sb.save_screenshot(f"fail_{sid}_read{i + 1}.png")
+            close_extra_tabs(sb, main)
+        sb.wait_for_element(X_CLAIM, by="xpath", timeout=10)
+        # 文章是独立弹窗, 在 xvfb 里会盖住面板窗口, 系统级点击会点到文章上 -> 先关掉
+        close_extra_tabs(sb, main)
+        back_to_main(sb, main)
+        sb.sleep(3)
+        kill_overlays(sb)
+        try:
+            sb.click("//button[normalize-space()='Got it']", by="xpath", timeout=2)
+        except Exception:
+            pass
+
+        if not pass_turnstile(sb, X_CLAIM, detach=True):
+            raise RuntimeError("续期弹窗 Turnstile 未通过")
+        safe_click(sb, X_CLAIM)
+        sb.sleep(5)
+        close_extra_tabs(sb, main)
+        after = open_server(sb, url)
+        log(f"{sid}: {before} 天 -> {after} 天")
+        if before is not None and after is not None and (after > before or after >= MAX_DAYS):
+            st, up = server_info(sb, sid)
+            return {"before": before, "after": after, "status": st, "uptime": up}
+        raise RuntimeError("剩余天数没有增加")
+    except Exception:
+        try:
+            sb.save_screenshot(f"fail_{sid}.png")
+        except Exception:
+            pass
+        raise
+
+
+
+# ---------------------------------------------------------------- Telegram 推送
+
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+SCHEDULE_TEXT = os.getenv("SCHEDULE_TEXT", "每 3 天 09:00（北京时间）")
+
+
+def mask_email(e):
+    if "@" not in e:
+        return (e[:1] + "***" + e[-1:]) if len(e) > 2 else "***"
+    u, d = e.split("@", 1)
+    return f"{u[:1]}***{u[-1:]}@{d}" if len(u) > 1 else f"{u}***@{d}"
+
+
+def build_report(mode, ip, results, login_error=None):
+    import html
+    esc = html.escape
+    bad = bool(login_error) or any(not r["ok"] for r in results)
+    ok_n = sum(1 for r in results if r["ok"])
+    head = "⚠️ <b>Orihost 运行报告（有异常）</b>" if bad else "✅ <b>Orihost 运行报告</b>"
+    node = {"代理": "🟢 已启用（代理）", "直连": "⚪ 未启用（直连）"}.get(mode, f"🔴 {esc(mode)}")
+    now = datetime.utcnow().timestamp() + 8 * 3600
+    lines = [head, "",
+             f"👤 账号：{esc(mask_email(EMAIL))}",
+             f"🌐 节点状态：{node}",
+             f"📍 出口IP：{esc(str(ip))}",
+             f"🕐 时间：{datetime.utcfromtimestamp(now):%Y/%m/%d %H:%M}"]
+    if login_error:
+        lines.append(f"❌ 登录失败：{esc(login_error[:200])}")
+    else:
+        lines.append(f"📊 共 {len(results)} 台：续期成功 {ok_n}，异常 {len(results) - ok_n}")
+    sep = "━━━━━━━━━━━━━━━"
+    for r in results:
+        lines += [sep, "", f"🖥 服务器 <code>#{esc(r['id'])}</code>"]
+        if r.get("status"):
+            lines.append(f"⚡ 状态：{r['status']}")
+        if r.get("uptime"):
+            lines.append(f"⏰ 运行时长：{esc(r['uptime'])}")
+        if r.get("started"):
+            lines.append("🔌 检测到关机，已自动开机")
+        elif r.get("start_error"):
+            lines.append(f"🔌 自动开机失败：{esc(r['start_error'])}")
+        if r.get("skipped"):
+            lines += ["✅ 已达续期上限，无需续期", f"📅 剩余：约 {r['before']} 天"]
+        elif r["ok"]:
+            lines += ["🎉 续期成功",
+                      f"📅 续期前：约 {r['before']} 天",
+                      f"✅ 续期后：约 {r['after']} 天"]
+        else:
+            lines += ["❌ 续期失败", f"⚠️ 原因：{esc(r.get('error') or '未知')[:200]}"]
+            if r.get("before") is not None:
+                lines.append(f"📅 剩余：约 {r['before']} 天")
+    lines += [sep, "", f"⏰ 自动检查：{SCHEDULE_TEXT}"]
+    return "\n".join(lines)
+
+
+def tg_send(text):
+    if not (TG_BOT_TOKEN and TG_CHAT_ID):
+        log("未设置 TG_BOT_TOKEN / TG_CHAT_ID，跳过推送")
+        return
+    import json
+    import urllib.request
+    data = json.dumps({"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML",
+                       "disable_web_page_preview": True}).encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                                 data=data, headers={"Content-Type": "application/json"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 直连
+    for i in range(3):
+        try:
+            with opener.open(req, timeout=20) as resp:
+                if resp.status == 200:
+                    log("Telegram 推送成功")
+                    return
+        except Exception as e:
+            log(f"Telegram 推送失败（第 {i + 1} 次）：{str(e)[:120]}")
+            time.sleep(3)
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    log(f"凭证路径: {credential_path()}")
+    from seleniumbase import SB
+
+    proxy_url, ip, mode = setup_network()
+    log(f"网络模式：{mode}，出口 IP：{ip}")
+    kw = dict(uc=True, test=True, headless=False, locale_code="en",
+              xvfb=sys.platform.startswith("linux"))
+    if proxy_url:
+        kw["proxy"] = proxy_url.split("://", 1)[-1]  # SB 要 host:port
+
+    results, login_error = [], None
+    try:
+        with SB(**kw) as sb:
+            try:
+                login(sb)
+            except Exception as e:
+                login_error = str(e).splitlines()[0] if str(e) else type(e).__name__
+                try:
+                    sb.save_screenshot("fail_login.png")
+                except Exception:
+                    pass
+                raise
+            save_cookies(sb)  # 登录成功立即导出，续期失败也不影响 cookie 更新
+
+            urls = server_urls(sb)
+            log(f"找到 {len(urls)} 台服务器")
+            for u in urls:
+                sid = u.rsplit("/", 1)[-1]
+                rec = {"id": sid, "ok": False, "error": None, "before": None}
+                for attempt in range(1, 3):  # 每台最多 2 次
+                    try:
+                        info = renew(sb, u)
+                        rec.update(info, ok=True)
+                        break
+                    except Exception as e:
+                        msg = str(e).splitlines()[0][:300] if str(e).strip() else "页面元素未出现"
+                        if msg.startswith("Message:"):
+                            msg = "页面元素未出现（Claim Renewal / 按钮）"
+                        rec["error"] = msg
+                        log(f"{u} 第 {attempt} 次续期失败：{msg}")
+                        if "CSRF" in msg:  # 会话 token 不一致 -> 清 cookie 用账号密码重新登录
+                            log("CSRF 不一致，清除 cookie 后重新登录")
+                            global COOKIE
+                            COOKIE = ""
+                            sb.driver.delete_all_cookies()
+                            login(sb)
+                            save_cookies(sb)
+                if not rec["ok"]:
+                    try:
+                        rec["before"] = renewal_days(sb)
+                        rec["status"], rec["uptime"] = server_info(sb, sid)
+                    except Exception:
+                        pass
+                try:
+                    ensure_running(sb, sid, rec)
+                except Exception as e:
+                    log(f"{sid}: 自动开机异常 {type(e).__name__}")
+                results.append(rec)
+            save_cookies(sb)
+    except Exception as e:
+        if not login_error:
+            login_error = None
+            results.append({"id": "-", "ok": False, "error": f"脚本异常：{str(e).splitlines()[0][:150]}"})
+        log("运行异常：", e)
+    finally:
+        try:
+            tg_send(build_report(mode, ip, results, login_error))
+        except Exception as e:
+            log("生成/发送报告失败：", e)
+
+    ok = sum(1 for r in results if r["ok"])
+    log(f"完成：{ok}/{len(results)} 台成功续期")
+    sys.exit(1 if login_error or any(not r["ok"] for r in results) else 0)
 
 
 if __name__ == "__main__":
