@@ -59,6 +59,9 @@ jobs:
           echo "--- xvfb-run ---"; command -v xvfb-run || { echo "❌ 缺 xvfb-run"; exit 1; }
           echo "--- chrome ---"; (google-chrome --version || chromium --version || echo "（暂无 chrome，SB 会自行安装）")
           echo "--- seleniumbase ---"; python -c "import seleniumbase; print('seleniumbase', seleniumbase.__version__)"
+          # 记低实际装到的版本，下次排障直接对（CEO 要求）
+          pip show seleniumbase | sed -n 's/^Version: /seleniumbase pip version: /p'
+          python -c "import seleniumbase, os; print('site:', os.path.dirname(seleniumbase.__file__))"
 
       # ── 家宽出口（mihomo / Clash Meta）──────────────────────────────
       # Orihost 会记录续期来源 IP，GHA 机房 IP 属于按 IP 风控的典型特征，
