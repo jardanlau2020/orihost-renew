@@ -644,7 +644,9 @@ def api_renew(sb, sid, url, before):
             d = json.loads(r2.get("text") or "{}")
         except Exception:
             d = {}
-        log(f"{sid}: complete 返回 {r2.get('status') if r2 else None}，renewed={d.get('renewed_count')} skipped={d.get('skipped_count')}")
+        log(f"{sid}: complete 返回 {r2.get('status') if r2 else None}，"
+            f"renewed={d.get('renewed_count')} skipped={d.get('skipped_count')} "
+            f"body={((r2 or {}).get('text') or '')[:500]}")
         if not (r2 and r2.get("status") == 200 and (d.get("renewed_count") or 0) > 0):
             return None
         after = open_server(sb, url)
@@ -660,19 +662,30 @@ def api_renew(sb, sid, url, before):
 
 
 def dump_buttons(sb, tag=""):
-    """打印页面所有 button 的文案与 class。
+    """dump 页面结构：buttons / 含 renew-claim 的 links / iframe 数 / 当前 URL。
 
-    2026-11-21 run #88：renew/begin 接口成功了，但页面上找不到 Claim Renewal。
-    按钮文案/选择器可能被面板改过，靠这份清单定位，不靠猜。
+    2026-11-21 run #88：renew/begin 成功，但 X_CLAIM
+    （//button[contains(normalize-space(),'Claim Renewal')]）匹配不到。
+    一次 dump 就能区分三种可能：按钮改成 <a>、文案变了、按钮在 iframe 里。
     """
     try:
-        btns = sb.execute_script(
-            "return Array.from(document.querySelectorAll('button')).map("
-            "function(b){return {t:(b.textContent||'').trim().slice(0,40),"
-            "c:(b.className||'').toString().slice(0,60)}})")
-        log(f"🔎 按钮清单{f'[{tag}]' if tag else ''}：{btns}")
+        info = sb.execute_script(
+            "return {"
+            "buttons: Array.from(document.querySelectorAll('button'))"
+            ".map(function(b){return (b.textContent||'').trim()})"
+            ".filter(function(t){return t}).slice(0,40),"
+            "links: Array.from(document.querySelectorAll('a'))"
+            ".map(function(a){return (a.textContent||'').trim()})"
+            ".filter(function(t){return t}).slice(0,60),"
+            "iframes: document.querySelectorAll('iframe').length,"
+            "url: location.href};")
+        links = info.get("links") or []
+        hit = [t for t in links if "renew" in t.lower() or "claim" in t.lower()]
+        log(f"🔎 dump{('[' + tag + ']') if tag else ''} url={info.get('url')}")
+        log(f"🔎 dump buttons={info.get('buttons')}")
+        log(f"🔎 dump iframes={info.get('iframes')} links含renew={hit}")
     except Exception as e:
-        log(f"🔎 读按钮清单失败：{type(e).__name__}: {e}")
+        log(f"🔎 dump 失败：{type(e).__name__}: {e}")
 
 
 def renew(sb, url):
