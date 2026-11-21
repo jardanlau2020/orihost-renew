@@ -92,18 +92,20 @@ jobs:
 
       - name: filter_mihomo.py 预检（只报告，不写文件）
         run: |
-          set -uo pipefail
-          # 用 --check：绝不改写订阅文件。
+          # GitHub 给 run 默认套 `bash -e`，所以不能写 `python ...; rc=$?` ——
+          # 脚本返回非 0 时 -e 会立刻退出，rc 根本取不到（run 44889549473 就是这么挂的）。
+          # 用 `|| rc=$?` 把失败吃掉再判断。
+          rc=0
+          python scripts/filter_mihomo.py --check home_sub.yaml || rc=$?
+          echo "filter 退出码 = $rc"
           # 退出码语义（脚本定义）：
           #   0 = 可用（可能丢了非住宅节点）
           #   1 = 致命（YAML 坏 / 一个节点都不剩）
           #   2 = 能解析，但住宅节点全丢 —— 对 mihomo 而言等于没有家宽
-          python scripts/filter_mihomo.py --check home_sub.yaml; rc=$?
-          echo "filter 退出码 = $rc"
           case "$rc" in
             0) echo "ℹ️ 住宅节点未被丢弃（这份配置 mihomo 可能能吃）" ;;
             2) echo "✅ 符合预期：住宅节点是 openvpn，mihomo 解析不了 → 该走 openvpn 直连" ;;
-            *) echo "❌ filter 致命错误（rc=$rc）"; exit 1 ;;
+            *) echo "::error::filter 致命错误（rc=$rc）"; exit 1 ;;
           esac
 
       - name: 列出可用住宅节点（为 0 则判失败，绝不产出假绿）
