@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -402,6 +403,33 @@ def driver_call(sb, fn, *args, **kwargs):
         log("⚠️ driver 连接被拒，2 秒后重试一次")
         time.sleep(2)
         return fn(*args, **kwargs)
+
+
+_STEP = {"name": "启动"}
+
+
+def step(name):
+    """标记当前步骤，心跳日志会带出来（run #82 黑箱 4 分 49 秒的教训）。"""
+    _STEP["name"] = name
+    log(f"▶ {name}")
+
+
+def start_heartbeat(sb, interval=20):
+    """后台线程每 interval 秒打一行心跳：当前步骤 + window_handles 数。
+    卡住时至少知道死在哪一步，不用再靠猜。"""
+    stop = threading.Event()
+
+    def _beat():
+        while not stop.wait(interval):
+            try:
+                n = len(sb.driver.window_handles)
+            except Exception as e:
+                n = f"不可用({type(e).__name__})"
+            log(f"💓 心跳：步骤={_STEP['name']} windows={n}")
+
+    t = threading.Thread(target=_beat, daemon=True)
+    t.start()
+    return stop
 
 
 def close_extra_tabs(sb, main):
@@ -800,6 +828,8 @@ def _run_browser(kw, results, state):
                 "driver 启动后连不上（window_handles 失败）→ 检查 Xvfb / Chrome / "
                 "图形依赖；workflow 必须用 xvfb-run 包住 python 命令")
         log("✅ driver 健康检查通过")
+        hb_stop = start_heartbeat(sb)
+        step("登录")
         try:
             login(sb)
         except Exception as e:
@@ -810,14 +840,18 @@ def _run_browser(kw, results, state):
                 pass
             raise
         save_cookies(sb)  # 登录成功立即导出，续期失败也不影响 cookie 更新
+        step("枚举服务器")
 
         urls = server_urls(sb)
         log(f"找到 {len(urls)} 台服务器")
+        step("逐台续期")
         for u in urls:
             sid = u.rsplit("/", 1)[-1]
             rec = {"id": sid, "ok": False, "error": None, "before": None}
             for attempt in range(1, 3):  # 每台最多 2 次
                 try:
+                    step(f"续期 {u.rsplit('/', 1)[-1]} 第{attempt}次")
+                    step(f"续期 {u.rsplit('/', 1)[-1]} 第{attempt}次")
                     info = renew(sb, u)
                     rec.update(info, ok=True)
                     break
@@ -890,6 +924,10 @@ def main():
             results.append({"id": "-", "ok": False, "error": f"脚本异常：{first[:200]}"})
         log("运行异常：", e)
     finally:
+        try:
+            hb_stop.set()
+        except Exception:
+            pass
         try:
             tg_send(build_report(mode, ip, results, state["login_error"]))
         except Exception as e:
