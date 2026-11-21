@@ -102,7 +102,9 @@ jobs:
           # 清理会让 mihomo 解析失败的空字段（ss 节点的 tls-crypt / 空密码等）
           sed -i -E "/^[[:space:]]*tls-crypt:[[:space:]]*('{2}|\"{2})?[[:space:]]*$/d" ./mihomo-home/config.yaml
           echo "--- config.yaml 前 3 行 ---"; head -3 ./mihomo-home/config.yaml
-          echo "--- proxies 数量 ---"; grep -c "^  - name:" ./mihomo-home/config.yaml || true
+          # grep -c "^  - name:" 在真实配置上恒为 0（缩进/结构不同），会误判成没节点。
+          # 改用 yaml 真解析，排障时看到的数字才是真的。
+          echo "--- proxies 数量 ---"; python -c "import yaml;d=yaml.safe_load(open('./mihomo-home/config.yaml',encoding='utf-8'));print(len(d.get('proxies') or []))" || true
 
           nohup ./mihomo-bin -d ./mihomo-home -f ./mihomo-home/config.yaml > mihomo.log 2>&1 &
           echo "MIHOMO_PID=$!" >> "$GITHUB_ENV"
