@@ -293,7 +293,14 @@ def login(sb):
     sb.sleep(3)
     if COOKIE:
         inject_cookie(sb)
-        sb.uc_open_with_reconnect(BASE + "/", 3)
+        # 2026-11-21: uc_open_with_reconnect 内部 driver.reconnect() 在 GHA 会把
+        # chromedriver 弄死（localhost:46579 Connection refused，卡满 300s）。
+        # 改用 uc_open：不 reconnect，只做 window.location.href 跳转。
+        sb.uc_open(BASE + "/")
+        for _ in range(20):
+            sb.sleep(0.5)
+            if "about:blank" not in (sb.current_url or ""):
+                break
         sb.sleep(4)
         if logged_in(sb):
             log("Cookie 登录成功")
