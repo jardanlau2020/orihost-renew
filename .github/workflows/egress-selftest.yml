@@ -19,13 +19,13 @@ on:
   workflow_dispatch:
     inputs:
       config_source:
-        description: '订阅来源：gz（默认，可能是过滤后的 63 节点）/ url（原始 132 节点，验 openvpn 用这个）'
+        description: '订阅来源：url（默认，原始 132 节点，含 69 个 openvpn）/ gz（已过滤成 63 节点，验不到 openvpn）'
         required: false
-        default: 'gz'
+        default: 'url'
         type: choice
         options:
-          - gz
           - url
+          - gz
       region:
         description: '地区关键字（KR / JP / MY），留空则取第一个可用节点'
         required: false
@@ -65,7 +65,7 @@ jobs:
           set -euo pipefail
           # HOME_SUB_GZ 现在装的是「只留 vless/trojan」的过滤版（63 节点），
           # 里面没有 openvpn 住宅节点，验 openvpn 必须用原始订阅（url）。
-          if [ "${SOURCE:-gz}" = "url" ]; then
+          if [ "${SOURCE:-url}" = "url" ]; then
             if [ -z "${HOME_SUB_URL:-}" ]; then
               echo "❌ config_source=url 但没有 HOME_SUB_URL"; exit 1
             fi
@@ -106,21 +106,22 @@ jobs:
             *) echo "❌ filter 致命错误（rc=$rc）"; exit 1 ;;
           esac
 
-      - name: 列出可用住宅节点（为 0 则明确「无法验证」）
+      - name: 列出可用住宅节点（为 0 则判失败，绝不产出假绿）
         run: |
           set -uo pipefail
           python scripts/openvpn_egress.py --config home_sub.yaml --list | tee /tmp/ovpn_list.txt
           N=$(grep -c '^\[ovpn\]   ' /tmp/ovpn_list.txt || true)
           echo "可用住宅节点数 = $N"
+          # 2026-11-21（冷王 review）：这里原来写 SKIP，job 判 success —— 是假绿。
+          # 「验不到」必须红，绿只允许代表「隧道起来且出口 IP 变了」。
           if [ "$N" = "0" ]; then
-            echo "⚠️ 这份配置里没有 openvpn 住宅节点，openvpn 路径无法验证。"
-            echo "⚠️ 常见原因：HOME_SUB_GZ 已被替换成「只留 vless/trojan」的过滤版（63 节点）。"
-            echo "⚠️ 要真验 openvpn，请改用含 69 个 openvpn 的原始订阅（config_source=url）。"
-            echo "SKIP_OPENVPN=1" >> "$GITHUB_ENV"
+            echo "::error::这份配置里没有 openvpn 住宅节点，openvpn 路径【未验证】—— 不是通过。"
+            echo "::error::常见原因：HOME_SUB_GZ 是「只留 vless/trojan」的过滤版（63 节点）。"
+            echo "::error::请用 config_source=url 走原始订阅（含 69 个 openvpn）再验。"
+            exit 1
           fi
 
       - name: 起 openvpn 隧道并验证出口 IP
-        if: ${{ env.SKIP_OPENVPN != '1' }}
         env:
           REGION: ${{ inputs.region }}
         run: |
