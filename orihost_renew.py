@@ -675,28 +675,32 @@ def api_renew(sb, sid, url, before):
 
 
 def dump_buttons(sb, tag=""):
-    """dump 页面结构：buttons / 含 renew-claim 的 links / iframe 数 / 当前 URL。
+    """dump 页面结构：buttons / 含 renew|read|claim|article 的 links / iframe 数 / url / 弹窗文本。
 
-    2026-11-21 run #88：renew/begin 成功，但 X_CLAIM
-    （//button[contains(normalize-space(),'Claim Renewal')]）匹配不到。
-    一次 dump 就能区分三种可能：按钮改成 <a>、文案变了、按钮在 iframe 里。
+    2026-11-21：九轮下来连 Renew 按钮长什么样都不知道。这个 dump 挂在失败路径上，
+    任何一步抛异常都会打印，用来定位「选择器对不上」还是「弹窗压根没打开」。
     """
     try:
         info = sb.execute_script(
             "return {"
             "buttons: Array.from(document.querySelectorAll('button'))"
             ".map(function(b){return (b.textContent||'').trim()})"
-            ".filter(function(t){return t}).slice(0,40),"
+            ".filter(function(t){return t}).slice(0,50),"
             "links: Array.from(document.querySelectorAll('a'))"
             ".map(function(a){return (a.textContent||'').trim()})"
-            ".filter(function(t){return t}).slice(0,60),"
+            ".filter(function(t){return t}).slice(0,80),"
             "iframes: document.querySelectorAll('iframe').length,"
-            "url: location.href};")
+            "url: location.href,"
+            "modal: ((document.querySelector('.ReactModal__Content')||{})"
+            ".innerText || '')};")
         links = info.get("links") or []
-        hit = [t for t in links if "renew" in t.lower() or "claim" in t.lower()]
+        hit = [t for t in links
+               if any(k in t.lower() for k in ("renew", "read", "claim", "article"))]
         log(f"🔎 dump{('[' + tag + ']') if tag else ''} url={info.get('url')}")
         log(f"🔎 dump buttons={info.get('buttons')}")
-        log(f"🔎 dump iframes={info.get('iframes')} links含renew={hit}")
+        log(f"🔎 dump iframes={info.get('iframes')}")
+        log(f"🔎 dump modal={(info.get('modal') or '')[:300]}")
+        log(f"🔎 dump links含renew/read/claim={hit}")
     except Exception as e:
         log(f"🔎 dump 失败：{type(e).__name__}: {e}")
 
@@ -922,6 +926,8 @@ def _run_browser(kw, results, state):
                     if msg.startswith("Message:"):
                         msg = "页面元素未出现（Claim Renewal / 按钮）"
                     rec["error"] = msg
+                    dump_buttons(sb, f"{sid}失败{attempt}")
+                    dump_buttons(sb, f"{sid}失败{attempt}")
                     log(f"{u} 第 {attempt} 次续期失败：{msg}")
                     if "CSRF" in msg:  # 会话 token 不一致 -> 清 cookie 用账号密码重新登录
                         log("CSRF 不一致，清除 cookie 后重新登录")
