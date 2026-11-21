@@ -77,7 +77,11 @@ COOKIE_OUT = os.getenv("COOKIE_OUT", "cookie.txt")
 
 TS_IFRAME = 'iframe[src*="challenges.cloudflare.com"]'
 MAX_DAYS = int(os.environ.get("MAX_DAYS", "21"))
-X_RENEW = "//button[contains(normalize-space(),'Renew')]"
+# 2026-11-21（#90 dump 实锤）：面板真实按钮文案是 `Renew server`，上游用
+# normalize-space()='Renew' 精确匹配，多一个词就永远匹配不到 -> 九轮下来弹窗
+# 一次都没打开，Turnstile 自然也没出现过（iframes=0 / modal 空）。
+# 改成 contains，并排除上限态按钮，避免把 "Renew Limit Reached" 当成可续期。
+X_RENEW = "//button[contains(normalize-space(),'Renew') and not(contains(normalize-space(),'Limit'))]"
 X_READ = "//button[contains(normalize-space(),'Read Article')]"
 X_CLAIM = "//button[contains(normalize-space(),'Claim Renewal')]"
 X_SIGNIN = "//button[@type='submit' or contains(normalize-space(),'Sign In')]"
@@ -217,16 +221,19 @@ def click_turnstile_box(sb):
     sb.uc_gui_click_x_y(x, y)
 
 
-def pass_turnstile(sb, wait_btn_xpath, timeout=90, detach=False):
+def pass_turnstile(sb, wait_btn_xpath, timeout=90, detach=False, require_token=False):
     """系统级鼠标点 Turnstile，直到目标按钮可点或拿到 token。
-    detach=True: 用于页面内动态弹出的 Turnstile, 先断开 webdriver 重新渲染再点。"""
+    detach=True: 用于页面内动态弹出的 Turnstile, 先断开 webdriver 重新渲染再点。
+    require_token=True: 只认 ts_token 非空。X_RENEW 改成 contains 之后它一直是
+    可点状态，用它当判据会立刻返回 True（点击 0 次）造成假阳性，接口续期那条路
+    必须只看 token。"""
     end = time.time() + 20
     while time.time() < end and not sb.is_element_present(TS_IFRAME):
         sb.sleep(1)
     sb.sleep(3)
     start, clicks = time.time(), 0
     while time.time() - start < timeout:
-        if btn_enabled(sb, wait_btn_xpath) or ts_token(sb):
+        if ts_token(sb) or (not require_token and btn_enabled(sb, wait_btn_xpath)):
             log(f"Turnstile 已通过（点击 {clicks} 次）")
             return True
         if clicks < 4 and (clicks == 0 or time.time() - start > clicks * 20):
@@ -655,9 +662,20 @@ def api_renew(sb, sid, url, before):
             sb.sleep(2)
             token = ts_token(sb) or ""
             if not token:
-                log(f"{sid}: 页面没有现成 token，走 pass_turnstile 过盾")
+                # #90 实锤：Renew 按钮一直没被点到，弹窗没开，所以页面上
+                # iframes=0、modal 空、Turnstile 根本不存在。先点开弹窗再找盾。
+                log(f"{sid}: 页面没有现成 token，先点开续期弹窗")
                 try:
-                    pass_turnstile(sb, X_RENEW, detach=True, timeout=60)
+                    safe_click(sb, X_RENEW, timeout=15)
+                except Exception as e:
+                    log(f"{sid}: 点 Renew 打开弹窗失败 {type(e).__name__}: {str(e)[:120]}")
+                sb.sleep(3)
+                dump_buttons(sb, f"{sid}-弹窗")
+                token = ts_token(sb) or ""
+            if not token:
+                log(f"{sid}: 弹窗里没有现成 token，走 pass_turnstile 过盾")
+                try:
+                    pass_turnstile(sb, X_RENEW, detach=True, timeout=60, require_token=True)
                 except Exception as e:
                     log(f"{sid}: pass_turnstile 异常 {type(e).__name__}: {str(e)[:120]}")
                 token = ts_token(sb) or ""
@@ -750,6 +768,8 @@ def renew(sb, url):
             kill_overlays(sb)
         safe_click(sb, X_RENEW)
         sb.sleep(2)
+        # 弹窗开没开、里面有哪些按钮/iframe，一次打出来（#90 之前一直在猜选择器）
+        dump_buttons(sb, f"{sid}-Renew后")
         close_extra_tabs(sb, main)
 
         for i in range(3):  # 广告可能吃掉 Read Article 的点击, 最多点 3 次
@@ -946,7 +966,6 @@ def _run_browser(kw, results, state):
                     if msg.startswith("Message:"):
                         msg = "页面元素未出现（Claim Renewal / 按钮）"
                     rec["error"] = msg
-                    dump_buttons(sb, f"{sid}失败{attempt}")
                     dump_buttons(sb, f"{sid}失败{attempt}")
                     log(f"{u} 第 {attempt} 次续期失败：{msg}")
                     if "CSRF" in msg:  # 会话 token 不一致 -> 清 cookie 用账号密码重新登录
