@@ -8,6 +8,14 @@ name: 家宽出口自测（openvpn）
 # 逻辑就是下面这几段，直接搬。
 
 on:
+  # 改动这三个文件时自动跑：自测本身就是为了证明它们在真 runner 上能用。
+  # 用 paths 过滤而不是硬写分支名，PR 分支上也能触发（workflow_dispatch 只认
+  # 默认分支上的文件，PR 分支上没法手动 dispatch）。
+  push:
+    paths:
+      - '.github/workflows/egress-selftest.yml'
+      - 'scripts/openvpn_egress.py'
+      - 'scripts/filter_mihomo.py'
   workflow_dispatch:
     inputs:
       region:
