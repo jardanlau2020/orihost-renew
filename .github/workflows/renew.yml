@@ -40,7 +40,23 @@ jobs:
         run: |
           pip install -r requirements.txt
           sudo apt-get update -y
-          sudo apt-get install -y xvfb
+          # SeleniumBase 的 uc 模式用 headless=False + 外部 Xvfb，缺 Xvfb 或图形库
+          # 就会「driver 连接 localhost:port 被拒」，所以这里一次装齐。
+          sudo apt-get install -y xvfb xvfb-run x11-utils libgbm1 libasound2t64 fonts-noto-cjk
+          # 不许静默失败：run #73 这步日志是空的，Xvfb 到底装没装没人知道
+          which Xvfb || { echo "❌ Xvfb 没装上"; exit 1; }
+          which xvfb-run || { echo "❌ xvfb-run 没装上"; exit 1; }
+          Xvfb -help 2>&1 | head -2
+
+      - name: 🔎 环境自检
+        # run #73 卡在 localhost:43457 connection refused，跑了 332 秒才超时。
+        # 先把 Xvfb / xvfb-run / chrome / seleniumbase 的存在打出来，起不来立刻失败。
+        run: |
+          set -e
+          echo "--- Xvfb ---"; command -v Xvfb || { echo "❌ 缺 Xvfb"; exit 1; }
+          echo "--- xvfb-run ---"; command -v xvfb-run || { echo "❌ 缺 xvfb-run"; exit 1; }
+          echo "--- chrome ---"; (google-chrome --version || chromium --version || echo "（暂无 chrome，SB 会自行安装）")
+          echo "--- seleniumbase ---"; python -c "import seleniumbase; print('seleniumbase', seleniumbase.__version__)"
 
       # ── 家宽出口（mihomo / Clash Meta）──────────────────────────────
       # Orihost 会记录续期来源 IP，GHA 机房 IP 属于按 IP 风控的典型特征，
@@ -126,8 +142,12 @@ jobs:
         run: |
           set -o pipefail
           which Xvfb || { echo "❌ Xvfb 没装上"; exit 1; }
+          which xvfb-run || { echo "❌ xvfb-run 没装上"; exit 1; }
           echo "DISPLAY 由 xvfb-run 提供"
-          timeout 900 xvfb-run -a --server-args="-screen 0 1920x1080x24"             python orihost_renew.py 2>&1 | tee raw.log
+          # 硬上限 300 秒：run #73 跑满 332 秒才发现 driver 起不来，不烧 CI。
+          # 注意 tee 会吞掉退出码，所以取 PIPESTATUS。
+          timeout 300 xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            python orihost_renew.py 2>&1 | tee raw.log
           rc=${PIPESTATUS[0]}
           echo "python exit code: $rc"
           exit $rc
