@@ -18,16 +18,19 @@ on:
       - 'scripts/filter_mihomo.py'
   workflow_dispatch:
     inputs:
+      config_source:
+        description: '订阅来源：gz（默认，可能是过滤后的 63 节点）/ url（原始 132 节点，验 openvpn 用这个）'
+        required: false
+        default: 'gz'
+        type: choice
+        options:
+          - gz
+          - url
       region:
         description: '地区关键字（KR / JP / MY），留空则取第一个可用节点'
         required: false
         default: 'KR'
         type: string
-      keep_types:
-        description: 'filter_mihomo.py 是否保留住宅节点（调试用，默认 false）'
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -57,10 +60,19 @@ jobs:
         env:
           HOME_SUB_URL: ${{ secrets.HOME_SUB_URL }}
           HOME_SUB_GZ: ${{ secrets.HOME_SUB_GZ }}
+          SOURCE: ${{ inputs.config_source }}
         run: |
           set -euo pipefail
-          if [ -n "${HOME_SUB_GZ:-}" ]; then
-            echo "📦 用 HOME_SUB_GZ 还原"
+          # HOME_SUB_GZ 现在装的是「只留 vless/trojan」的过滤版（63 节点），
+          # 里面没有 openvpn 住宅节点，验 openvpn 必须用原始订阅（url）。
+          if [ "${SOURCE:-gz}" = "url" ]; then
+            if [ -z "${HOME_SUB_URL:-}" ]; then
+              echo "❌ config_source=url 但没有 HOME_SUB_URL"; exit 1
+            fi
+            echo "🌐 用 HOME_SUB_URL（原始订阅）"
+            curl -fsSL --retry 2 --max-time 30 -o home_sub.yaml "$HOME_SUB_URL"
+          elif [ -n "${HOME_SUB_GZ:-}" ]; then
+            echo "📦 用 HOME_SUB_GZ 还原（注意：可能是过滤后的 63 节点版）"
             echo "$HOME_SUB_GZ" | base64 -d | gunzip > home_sub.yaml
           elif [ -n "${HOME_SUB_URL:-}" ]; then
             curl -fsSL --retry 2 --max-time 30 -o home_sub.yaml "$HOME_SUB_URL"
@@ -74,25 +86,41 @@ jobs:
           px = d.get('proxies') or []
           print('节点总数:', len(px))
           print('类型分布:', dict(collections.Counter(p.get('type') for p in px)))
+          ov = [p for p in px if p.get('type') == 'openvpn']
+          print('openvpn 住宅节点:', len(ov))
           PY
 
-      - name: filter_mihomo.py 预检（预期 exit 2：住宅节点全丢）
+      - name: filter_mihomo.py 预检（只报告，不写文件）
         run: |
           set -uo pipefail
+          # 用 --check：绝不改写订阅文件。
+          # 退出码语义（脚本定义）：
+          #   0 = 可用（可能丢了非住宅节点）
+          #   1 = 致命（YAML 坏 / 一个节点都不剩）
+          #   2 = 能解析，但住宅节点全丢 —— 对 mihomo 而言等于没有家宽
           python scripts/filter_mihomo.py --check home_sub.yaml; rc=$?
           echo "filter 退出码 = $rc"
-          if [ "$rc" = "2" ]; then
-            echo "✅ 符合预期：住宅节点是 openvpn，mihomo 解析不了 → 走 openvpn 直连"
-          elif [ "$rc" = "0" ]; then
-            echo "⚠️ 住宅节点没被丢，说明这份配置 mihomo 可能能吃；仍继续测 openvpn"
-          else
-            echo "❌ filter 异常退出"; exit 1
+          case "$rc" in
+            0) echo "ℹ️ 住宅节点未被丢弃（这份配置 mihomo 可能能吃）" ;;
+            2) echo "✅ 符合预期：住宅节点是 openvpn，mihomo 解析不了 → 该走 openvpn 直连" ;;
+            *) echo "❌ filter 致命错误（rc=$rc）"; exit 1 ;;
+          esac
+
+      - name: 列出可用住宅节点（为 0 则明确「无法验证」）
+        run: |
+          set -uo pipefail
+          python scripts/openvpn_egress.py --config home_sub.yaml --list | tee /tmp/ovpn_list.txt
+          N=$(grep -c '^\[ovpn\]   ' /tmp/ovpn_list.txt || true)
+          echo "可用住宅节点数 = $N"
+          if [ "$N" = "0" ]; then
+            echo "⚠️ 这份配置里没有 openvpn 住宅节点，openvpn 路径无法验证。"
+            echo "⚠️ 常见原因：HOME_SUB_GZ 已被替换成「只留 vless/trojan」的过滤版（63 节点）。"
+            echo "⚠️ 要真验 openvpn，请改用含 69 个 openvpn 的原始订阅（config_source=url）。"
+            echo "SKIP_OPENVPN=1" >> "$GITHUB_ENV"
           fi
 
-      - name: 列出可用住宅节点
-        run: python scripts/openvpn_egress.py --config home_sub.yaml --list | head -15
-
       - name: 起 openvpn 隧道并验证出口 IP
+        if: ${{ env.SKIP_OPENVPN != '1' }}
         env:
           REGION: ${{ inputs.region }}
         run: |
@@ -103,23 +131,33 @@ jobs:
           python scripts/openvpn_egress.py --config home_sub.yaml \
             ${REGION:+--region "$REGION"} --out /tmp/node.ovpn
 
+          # 强制接管默认路由：没有这行，curl 还是走原网卡，会误判节点失败
+          echo 'redirect-gateway def1' >> /tmp/node.ovpn
           sudo openvpn --config /tmp/node.ovpn --daemon --log /tmp/ovpn.log
+
           for i in $(seq 1 20); do
             sleep 3
-            PROXY_IP="$(curl -s --max-time 8 https://api.ipify.org || true)"
-            [ -n "$PROXY_IP" ] && break
+            TUN_IF="$(ip -o link show | awk -F': ' '/ tun/{print $2; exit}')"
+            if [ -n "$TUN_IF" ]; then
+              PROXY_IP="$(curl -s --interface "$TUN_IF" --max-time 8 https://api.ipify.org || true)"
+              [ -n "$PROXY_IP" ] && break
+            fi
           done
+          echo "📡 tun 接口: ${TUN_IF:-无}"
           echo "📡 隧道出口 IP: ${PROXY_IP:-未知}"
           echo "--- openvpn 日志尾部 ---"
           sudo tail -20 /tmp/ovpn.log || true
 
+          if [ -z "${TUN_IF:-}" ]; then
+            echo "❌ 没有 tun 接口，隧道没建立"; exit 1
+          fi
           if [ -z "${PROXY_IP:-}" ]; then
-            echo "❌ 隧道没起来"; exit 1
+            echo "❌ 隧道接口拿不到出口 IP"; exit 1
           fi
           if [ "$PROXY_IP" = "$DIRECT_IP" ]; then
             echo "❌ 出口 IP 与直连相同，隧道没生效"; exit 1
           fi
-          echo "✅ 家宽出口可用：$DIRECT_IP → $PROXY_IP"
+          echo "✅ openvpn 住宅出口可用：$DIRECT_IP → $PROXY_IP"
 
       - name: 收隧道
         if: always()
