@@ -66,6 +66,13 @@ def render_ovpn(n: dict, auth_path: str = "") -> str:
         "verb 3",
         f"cipher {n.get('cipher') or 'AES-128-CBC'}",
         f"auth {n.get('auth') or 'SHA1'}",
+        # 2026-11-21（run 44889632574 实证）：OpenVPN 2.6+ 的 --data-ciphers
+        # 默认值 'DEFAULT' 已经不含 AES-128-CBC，连这种老服务器会报
+        #   OPTIONS ERROR: failed to negotiate cipher with server.
+        #   Add the server's cipher ('AES-128-CBC') to --data-ciphers
+        # 必须显式把服务器的 cipher 加进协商列表。
+        f"data-ciphers {n.get('cipher') or 'AES-128-CBC'}:AES-256-GCM:AES-128-GCM",
+        f"data-ciphers-fallback {n.get('cipher') or 'AES-128-CBC'}",
         # 住宅节点一般是自签 CA，不校验对端名字
         "remote-cert-tls server",
         "auth-nocache",
