@@ -293,8 +293,14 @@ def login(sb):
     sb.sleep(3)
     if COOKIE:
         inject_cookie(sb)
-        sb.uc_open_with_reconnect(BASE + "/", 3)
-        sb.sleep(4)
+        # 只改这一处（CEO 控制变量）：run #85 的 300 秒卡死就在这里，
+        # uc_open_with_reconnect 内部 driver.reconnect() 会把 chromedriver 弄死。
+        sb.uc_open(BASE + "/")
+        # uc_open 的跳转是 call_me_later 延迟 5 秒，死等不可靠，轮询 URL 变化
+        for _ in range(15):
+            sb.sleep(0.5)
+            if "about:blank" not in (sb.current_url or ""):
+                break
         if logged_in(sb):
             log("Cookie 登录成功")
             return
