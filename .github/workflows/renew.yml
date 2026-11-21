@@ -143,6 +143,9 @@ jobs:
           ORIHOST_PASSWORD: ${{ secrets.ORIHOST_PASSWORD }}
           ORIHOST_COOKIE: ${{ secrets.ORIHOST_COOKIE }}
           ORIHOST_REMEMBER: ${{ secrets.ORIHOST_REMEMBER }}
+          # 2026-11-21: 面板改版后 renewal/complete 需要 cf-turnstile-response，
+          # 无 token 必回 400。关掉接口捷径，强制走页面流程（那里有 pass_turnstile）。
+          API_RENEW: "0"
           NODE_LINK: ${{ secrets.NODE_LINK }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
