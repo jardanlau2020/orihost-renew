@@ -299,7 +299,7 @@ def login(sb):
         # uc_open 的跳转是 call_me_later 延迟 5 秒，死等不可靠，轮询 URL 变化
         for _ in range(15):
             sb.sleep(0.5)
-            if "about:blank" not in (sb.current_url or ""):
+            if "about:blank" not in (sb.get_current_url() or ""):
                 break
         if logged_in(sb):
             log("Cookie 登录成功")
