@@ -99,19 +99,46 @@ def credential_path() -> str:
 # ---------------------------------------------------------------- 网络
 
 def setup_network():
-    """返回 (本地代理URL或None, 脱敏出口IP, 模式)。代理失败回落直连。"""
+    """返回 (本地代理URL或None, 脱敏出口IP, 模式)。
+
+    2026-11-21 改：不再「没家宽就偷偷用 NODE_LINK 降级」。机房 IP 去续期是
+    风险最高的跑法（Cloudflare 一眼看穿，Turnstile 必挂），所以要显式：
+      - NODE_PROXY_URL 有值（workflow 起好 mihomo）→ 先验端口，不通就抛错
+      - 没 NODE_PROXY_URL 但配了 HOME_SUB_URL → workflow 该起却没起来，抛错
+      - 两者都没有 → 明确以「无代理」跑，日志写清楚
+      - 想用 NODE_LINK 走 sing-box，必须显式设 ORIHOST_USE_NODE_LINK=1
+    """
     ext = os.getenv("NODE_PROXY_URL", "").strip()
-    if ext:  # 前一步 gxjxzhoo/Node_Proxy Action 已起好代理
-        log("使用 Node_Proxy Action 提供的本地代理")
+    home = (os.getenv("HOME_SUB_URL", "").strip()
+            or os.getenv("HOME_SUB_GZ", "").strip())
+    if ext:
+        host_port = ext.split("://", 1)[-1]
+        try:
+            import socket
+            host, port = host_port.rsplit(":", 1)
+            with socket.create_connection((host, int(port)), timeout=3):
+                pass
+        except Exception as e:
+            raise RuntimeError(
+                f"代理端口不通（{host_port}）：{e} → 不降级直连，先修代理")
+        log(f"使用家宽出口：{ext}")
         return ext, os.getenv("NODE_PROXY_IP", "") or "未知", "代理"
-    if NODE_LINK.strip():
+
+    if home:
+        raise RuntimeError(
+            "配了 HOME_SUB_URL / HOME_SUB_GZ 但 workflow 没起 mihomo（NODE_PROXY_URL 为空）"
+            " → 不降级直连，先修 workflow")
+
+    if os.getenv("ORIHOST_USE_NODE_LINK", "").strip().lower() in ("1", "true", "yes") and NODE_LINK.strip():
         try:
             proxy, ip, _ = setup_node_proxy(NODE_LINK, workdir=os.getenv("RUNNER_TEMP", "/tmp"))
-            return proxy, ip or "未知", "代理"
+            return proxy, ip or "未知", "代理(NODE_LINK)"
         except Exception as e:
-            log("代理启动失败，回落直连：", e)
-            return None, probe_exit_ip() or "未知", "直连(代理失败)"
-    return None, probe_exit_ip() or "未知", "直连"
+            raise RuntimeError(f"NODE_LINK 代理起不来：{e} → 不降级直连") from e
+
+    log("⚠️ 未配置 HOME_SUB_URL / HOME_SUB_GZ：以无代理模式运行"
+        "（出口=机房 IP，Turnstile 可能必挂）")
+    return None, probe_exit_ip() or "未知", "无代理"
 
 
 # ---------------------------------------------------------------- Turnstile
@@ -353,8 +380,32 @@ def kill_overlays(sb):
         return 0
 
 
+def driver_alive(sb) -> bool:
+    """driver 还活着吗。2026-11-21：run #73 就是半路 driver 死掉，
+    之后任何 window_handles 调用都抛 Connection refused 收场。"""
+    try:
+        sb.driver.window_handles
+        return True
+    except Exception:
+        return False
+
+
+def driver_call(sb, fn, *args, **kwargs):
+    """调 WebDriver；连接被拒（driver 半路死）时等 2 秒重试一次。"""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        msg = str(e)
+        if not any(k in msg for k in ("Connection refused", "MaxRetryError",
+                                      "NewConnectionError", "localhost")):
+            raise
+        log("⚠️ driver 连接被拒，2 秒后重试一次")
+        time.sleep(2)
+        return fn(*args, **kwargs)
+
+
 def close_extra_tabs(sb, main):
-    for h in list(sb.driver.window_handles):
+    for h in list(driver_call(sb, lambda: sb.driver.window_handles)):
         if h != main:
             try:
                 sb.driver.switch_to.window(h)
@@ -724,80 +775,129 @@ def tg_send(text):
 
 # ---------------------------------------------------------------- main
 
+def driver_error(e) -> bool:
+    """是不是「驱动/浏览器起不来」那类错（区别于业务失败）。"""
+    msg = str(e) or type(e).__name__
+    return any(k in msg for k in (
+        "Connection refused", "MaxRetryError", "NewConnectionError", "localhost",
+        "WebDriver", "chromedriver", "session not created", "DevToolsActivePort"))
+
+
+def _run_browser(kw, results, state):
+    """开一只浏览器跑完整流程。driver 起不来就抛，由 main 决定是否重开。"""
+    from seleniumbase import SB
+    with SB(**kw) as sb:
+        # 元素等待上限收到 20 秒：上一轮 driver 起不来时跑到 332 秒才超时，
+        # 那是驱动连接层的问题，不该让每个 wait 都按默认 30-60 秒慢慢熬。
+        try:
+            sb.set_default_timeout(20)
+        except Exception:
+            pass
+        # driver 健康检查：run #73 就是「SB 起来了但浏览器没起来」，
+        # 之后第一次调 window_handles 才炸。这里先探一次，立刻定性。
+        if not driver_alive(sb):
+            raise RuntimeError(
+                "driver 启动后连不上（window_handles 失败）→ 检查 Xvfb / Chrome / "
+                "图形依赖；workflow 必须用 xvfb-run 包住 python 命令")
+        log("✅ driver 健康检查通过")
+        try:
+            login(sb)
+        except Exception as e:
+            state["login_error"] = str(e).splitlines()[0] if str(e) else type(e).__name__
+            try:
+                sb.save_screenshot("fail_login.png")
+            except Exception:
+                pass
+            raise
+        save_cookies(sb)  # 登录成功立即导出，续期失败也不影响 cookie 更新
+
+        urls = server_urls(sb)
+        log(f"找到 {len(urls)} 台服务器")
+        for u in urls:
+            sid = u.rsplit("/", 1)[-1]
+            rec = {"id": sid, "ok": False, "error": None, "before": None}
+            for attempt in range(1, 3):  # 每台最多 2 次
+                try:
+                    info = renew(sb, u)
+                    rec.update(info, ok=True)
+                    break
+                except Exception as e:
+                    msg = str(e).splitlines()[0][:300] if str(e).strip() else "页面元素未出现"
+                    if msg.startswith("Message:"):
+                        msg = "页面元素未出现（Claim Renewal / 按钮）"
+                    rec["error"] = msg
+                    log(f"{u} 第 {attempt} 次续期失败：{msg}")
+                    if "CSRF" in msg:  # 会话 token 不一致 -> 清 cookie 用账号密码重新登录
+                        log("CSRF 不一致，清除 cookie 后重新登录")
+                        global COOKIE
+                        COOKIE = ""
+                        sb.driver.delete_all_cookies()
+                        login(sb)
+                        save_cookies(sb)
+            if not rec["ok"]:
+                try:
+                    rec["before"] = renewal_days(sb)
+                    rec["status"], rec["uptime"] = server_info(sb, sid)
+                except Exception:
+                    pass
+            try:
+                ensure_running(sb, sid, rec)
+            except Exception as e:
+                log(f"{sid}: 自动开机异常 {type(e).__name__}")
+            results.append(rec)
+        save_cookies(sb)
+
+
 def main():
     log(f"凭证路径: {credential_path()}")
     from seleniumbase import SB
 
     proxy_url, ip, mode = setup_network()
     log(f"网络模式：{mode}，出口 IP：{ip}")
+    log(f"平台={sys.platform} DISPLAY={os.environ.get('DISPLAY') or '（空）'}")
+    # 2026-11-21：xvfb 交给 workflow 的 xvfb-run 显式管理（SB 自管那套在 GHA 上
+    # 起不来：driver 连 localhost:43457 被拒、332 秒才超时）。这里只要求有 DISPLAY。
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+        log("⚠️ DISPLAY 为空：headless=False 需要 Xvfb（workflow 用 xvfb-run 提供）")
     kw = dict(uc=True, test=True, headless=False, locale_code="en",
-              xvfb=sys.platform.startswith("linux"))
+              pageLoadStrategy="eager")
     if proxy_url:
         kw["proxy"] = proxy_url.split("://", 1)[-1]  # SB 要 host:port
 
-    results, login_error = [], None
+    results = []
+    state = {"login_error": None}
     try:
-        with SB(**kw) as sb:
+        # load藤 #73 要求：seleniumbase 报 localhost:port refused 时重启 driver 重试一次，
+        # 别整个 run 直接挂。这里直接重开整只浏览器（driver 半路死了重连不可靠）。
+        for attempt in (1, 2):
             try:
-                login(sb)
+                _run_browser(kw, results, state)
+                break
             except Exception as e:
-                login_error = str(e).splitlines()[0] if str(e) else type(e).__name__
-                try:
-                    sb.save_screenshot("fail_login.png")
-                except Exception:
-                    pass
+                if attempt == 1 and driver_error(e):
+                    log("⚠️ driver 起不来 / 半路死掉，重开浏览器重试一次")
+                    time.sleep(3)
+                    continue
                 raise
-            save_cookies(sb)  # 登录成功立即导出，续期失败也不影响 cookie 更新
-
-            urls = server_urls(sb)
-            log(f"找到 {len(urls)} 台服务器")
-            for u in urls:
-                sid = u.rsplit("/", 1)[-1]
-                rec = {"id": sid, "ok": False, "error": None, "before": None}
-                for attempt in range(1, 3):  # 每台最多 2 次
-                    try:
-                        info = renew(sb, u)
-                        rec.update(info, ok=True)
-                        break
-                    except Exception as e:
-                        msg = str(e).splitlines()[0][:300] if str(e).strip() else "页面元素未出现"
-                        if msg.startswith("Message:"):
-                            msg = "页面元素未出现（Claim Renewal / 按钮）"
-                        rec["error"] = msg
-                        log(f"{u} 第 {attempt} 次续期失败：{msg}")
-                        if "CSRF" in msg:  # 会话 token 不一致 -> 清 cookie 用账号密码重新登录
-                            log("CSRF 不一致，清除 cookie 后重新登录")
-                            global COOKIE
-                            COOKIE = ""
-                            sb.driver.delete_all_cookies()
-                            login(sb)
-                            save_cookies(sb)
-                if not rec["ok"]:
-                    try:
-                        rec["before"] = renewal_days(sb)
-                        rec["status"], rec["uptime"] = server_info(sb, sid)
-                    except Exception:
-                        pass
-                try:
-                    ensure_running(sb, sid, rec)
-                except Exception as e:
-                    log(f"{sid}: 自动开机异常 {type(e).__name__}")
-                results.append(rec)
-            save_cookies(sb)
     except Exception as e:
-        if not login_error:
-            login_error = None
-            results.append({"id": "-", "ok": False, "error": f"脚本异常：{str(e).splitlines()[0][:150]}"})
+        first = str(e).splitlines()[0] if str(e) else type(e).__name__
+        # 2026-11-21 run 44886971638：driver 连 localhost:43457 被拒、332 秒才超时。
+        # 那是环境问题（Xvfb/Chrome 没起来），不是业务失败，报错要说人话。
+        if driver_error(e):
+            first = (f"浏览器驱动起不来（{first[:100]}）→ 检查 Xvfb / Chrome / "
+                     f"图形依赖；headless=False 必须有可用的 Xvfb")
+        if state["login_error"] is None:
+            results.append({"id": "-", "ok": False, "error": f"脚本异常：{first[:200]}"})
         log("运行异常：", e)
     finally:
         try:
-            tg_send(build_report(mode, ip, results, login_error))
+            tg_send(build_report(mode, ip, results, state["login_error"]))
         except Exception as e:
             log("生成/发送报告失败：", e)
 
     ok = sum(1 for r in results if r["ok"])
     log(f"完成：{ok}/{len(results)} 台成功续期")
-    sys.exit(1 if login_error or any(not r["ok"] for r in results) else 0)
+    sys.exit(1 if state["login_error"] or any(not r["ok"] for r in results) else 0)
 
 
 if __name__ == "__main__":
