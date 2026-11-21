@@ -82,8 +82,12 @@ MAX_DAYS = int(os.environ.get("MAX_DAYS", "21"))
 # 一次都没打开，Turnstile 自然也没出现过（iframes=0 / modal 空）。
 # 改成 contains，并排除上限态按钮，避免把 "Renew Limit Reached" 当成可续期。
 X_RENEW = "//button[contains(normalize-space(),'Renew') and not(contains(normalize-space(),'Limit'))]"
-X_READ = "//button[contains(normalize-space(),'Read Article')]"
-X_CLAIM = "//button[contains(normalize-space(),'Claim Renewal')]"
+X_READ = ("//button[contains(translate(normalize-space()," 
+          "    'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')," 
+          "    'read article')]")
+X_CLAIM = ("//button[contains(translate(normalize-space()," 
+           "    'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')," 
+           "    'claim')]")
 X_SIGNIN = "//button[@type='submit' or contains(normalize-space(),'Sign In')]"
 
 
