@@ -163,6 +163,10 @@ def main(argv=None) -> int:
     ap.add_argument("dst", nargs="?")
     ap.add_argument("--check", action="store_true", help="只报告，不写文件")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument(
+        "--allow-loss", action="store_true",
+        help="住宅节点全丢时仍然 exit 0（默认 exit 2，避免 workflow 误判成功）",
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -175,19 +179,40 @@ def main(argv=None) -> int:
         print("[filter] ❌ 顶层不是映射，配置结构不对", file=sys.stderr)
         return 1
 
-    kept, _ = filter_config(data, verbose=not args.quiet)
+    kept, dropped = filter_config(data, verbose=not args.quiet)
     if not kept:
         print("[filter] ❌ 清洗后没有任何可用节点", file=sys.stderr)
         return 1
 
+    # 2026-11-21（冷王 review 第 ② 条）：住宅节点被丢光时不能 exit 0。
+    # 否则 workflow 以为「家宽已就绪」，实际出口是机房 IP —— 和 #5 的
+    # 「不静默降级直连」原则直接冲突，Cloudflare 那边照样拦。
+    home_dropped = [d for d in dropped if "家宽" in str(d[1] or "")]
+    home_kept = [p for p in kept if "家宽" in str(p.get("name") or "")]
+    residential_lost = bool(home_dropped) and not home_kept
+
     if args.check:
         print("[filter] --check：不写文件")
-        return 0
+    else:
+        dst = args.dst or args.src
+        with open(dst, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False, width=100000)
+        print(f"[filter] ✅ 已写入 {dst}")
 
-    dst = args.dst or args.src
-    with open(dst, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False, width=100000)
-    print(f"[filter] ✅ 已写入 {dst}")
+    if residential_lost:
+        print(
+            f"[filter] ❌ 住宅节点全部被丢弃（{len(home_dropped)} 个），"
+            "清洗后的出口只剩机房 IP —— 这份配置对 Cloudflare 没有意义。",
+            file=sys.stderr,
+        )
+        print(
+            "[filter]   住宅节点是 openvpn 类型且缺 tls-crypt，mihomo 解析不了；"
+            "改用 scripts/openvpn_egress.py 直接开隧道。",
+            file=sys.stderr,
+        )
+        if not args.allow_loss:
+            return 2
+        print("[filter] ⚠️ --allow-loss 已指定，仍返回 0")
     return 0
 
 
