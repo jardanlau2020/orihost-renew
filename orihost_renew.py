@@ -639,14 +639,22 @@ def api_renew(sb, sid, url, before):
             dwell = 15
         log(f"{sid}: 接口续期已开始，等待 {dwell + 2}s")
         time.sleep(min(dwell, 120) + 2)
-        r2 = panel_api(sb, "GET", "/api/client/renewal/complete")
+        # complete 是真正的断点（#88：begin 成功、complete 回 400）。
+        # 单独包 try/except，把「调用异常」和「面板回 400」两种情况分开记。
         try:
-            d = json.loads(r2.get("text") or "{}")
-        except Exception:
-            d = {}
-        log(f"{sid}: complete 返回 {r2.get('status') if r2 else None}，"
-            f"renewed={d.get('renewed_count')} skipped={d.get('skipped_count')} "
+            r2 = panel_api(sb, "GET", "/api/client/renewal/complete")
+        except Exception as e:
+            log(f"{sid}: complete 调用异常 {type(e).__name__}: {str(e)[:200]}")
+            return None
+        log(f"{sid}: complete 原始返回 status={r2.get('status') if r2 else None} "
             f"body={((r2 or {}).get('text') or '')[:500]}")
+        try:
+            d = json.loads((r2 or {}).get("text") or "{}")
+        except Exception as e:
+            log(f"{sid}: complete body 不是 JSON：{type(e).__name__}: {str(e)[:120]}")
+            d = {}
+        log(f"{sid}: complete 解析后 renewed={d.get('renewed_count')} "
+            f"skipped={d.get('skipped_count')}")
         if not (r2 and r2.get("status") == 200 and (d.get("renewed_count") or 0) > 0):
             return None
         after = open_server(sb, url)
