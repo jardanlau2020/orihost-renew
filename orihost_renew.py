@@ -631,12 +631,24 @@ def read_article(sb, sid, main):
     kill_overlays(sb)
 
 
-# 2026-11-21：面板 bundle 里 `Read Article` / `Claim Renewal` 命中 0 次
-# （1456800 字节主包），页面点击流程是写给旧面板的，永远匹配不到。
-# 真实路径是接口：renew/begin(200) → 过 Turnstile 拿 token → renewal/complete
-# 带上 ?cf-turnstile-response=<token>。所以接口续期默认开启。
-# 临时要退回页面流程（排查用）：API_RENEW=0。
-API_RENEW = os.getenv("API_RENEW", "1").strip().lower() not in ("0", "false", "no", "")
+# 2026-11-21（run 44894132904 实锤）：接口路径结构上走不通，默认关闭。
+#
+# 那次是 11 轮里唯一成功的一轮，4 天 -> 11 天，但它涨天数靠的是页面流程，
+# 不是接口：
+#   [10:25:23] 接口续期已开始，等待 17s
+#   [10:27:14] token 长度=0 -> complete 400 "Failed to validate Turnstile data"
+#   [10:27:24] 回退页面流程，iframes=1        <- 这里才开始有进展
+#   [10:27:30] 文章页 albeu.com/...
+#   [10:28:52] Turnstile 已通过（点击 2 次）
+#   [10:29:03] 4 天 -> 11 天
+#
+# 原因不是实现没写好，是路径本身拿不到 token：complete 要的 cf-turnstile-response
+# 只能由「点开续期弹窗 -> 点 Read article -> widget 渲染」产生，而接口路径压根不
+# 打开那个弹窗。所以它每次只会白烧约 2 分钟（dwell 等待 + 过盾重试），还多调一次
+# renew/begin。
+#
+# 保留 api_renew() 与开关：面板若改回不需要 token，API_RENEW=1 可立刻启用。
+API_RENEW = os.getenv("API_RENEW", "0").strip().lower() not in ("0", "false", "no", "")
 
 
 def api_renew(sb, sid, url, before):
