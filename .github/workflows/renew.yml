@@ -1,4 +1,4 @@
-name: Orihost 自动续期
+﻿name: Orihost 自动续期
 
 on:
   schedule:
@@ -50,10 +50,13 @@ jobs:
         if: ${{ !inputs.no_proxy }}
         env:
           HOME_SUB_URL: ${{ secrets.HOME_SUB_URL }}
+          HOME_SUB_GZ: ${{ secrets.HOME_SUB_GZ }}
         run: |
           set -euo pipefail
-          if [ -z "${HOME_SUB_URL:-}" ]; then
-            echo "⚪ 未配置 HOME_SUB_URL，跳过家宽出口"
+          HAVE_URL=0; [ -n "${HOME_SUB_URL:-}" ] && HAVE_URL=1
+          HAVE_GZ=0;  [ -n "${HOME_SUB_GZ:-}" ]  && HAVE_GZ=1
+          if [ "$HAVE_URL" = 0 ] && [ "$HAVE_GZ" = 0 ]; then
+            echo "⚪ 未配置 HOME_SUB_URL / HOME_SUB_GZ，跳过家宽出口"
             exit 0
           fi
 
@@ -64,9 +67,18 @@ jobs:
           mv /tmp/mihomo ./mihomo-bin
           chmod +x ./mihomo-bin
 
-          echo "📥 拉订阅并生成配置"
+          echo "📥 生成配置"
           mkdir -p ./mihomo-home
-          curl -fsSL --retry 3 -o ./mihomo-home/config.yaml "$HOME_SUB_URL"
+          if [ "$HAVE_URL" = 1 ] && curl -fsSL --retry 2 --max-time 30 -o ./mihomo-home/config.yaml "$HOME_SUB_URL"; then
+            echo "✅ 订阅地址可用"
+          elif [ "$HAVE_GZ" = 1 ]; then
+            echo "📦 用 HOME_SUB_GZ 还原配置"
+            echo "$HOME_SUB_GZ" | base64 -d | gunzip > ./mihomo-home/config.yaml
+          else
+            echo "❌ 订阅地址拉取失败且无 HOME_SUB_GZ 可用"
+            exit 1
+          fi
+          echo "--- config.yaml 前 3 行 ---"; head -3 ./mihomo-home/config.yaml
 
           nohup ./mihomo-bin -d ./mihomo-home -f ./mihomo-home/config.yaml > mihomo.log 2>&1 &
           echo "MIHOMO_PID=$!" >> "$GITHUB_ENV"
@@ -107,7 +119,12 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           set -o pipefail
-          python orihost_renew.py 2>&1 | tee raw.log
+          which Xvfb || { echo "❌ Xvfb 没装上"; exit 1; }
+          echo "DISPLAY 由 xvfb-run 提供"
+          timeout 900 xvfb-run -a --server-args="-screen 0 1920x1080x24"             python orihost_renew.py 2>&1 | tee raw.log
+          rc=${PIPESTATUS[0]}
+          echo "python exit code: $rc"
+          exit $rc
 
       - name: 💾 回写 ORIHOST_COOKIE
         if: always()
