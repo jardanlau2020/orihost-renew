@@ -860,7 +860,7 @@ def main():
     if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
         log("⚠️ DISPLAY 为空：headless=False 需要 Xvfb（workflow 用 xvfb-run 提供）")
     kw = dict(uc=True, test=True, headless=False, locale_code="en",
-              pageLoadStrategy="eager")
+              page_load_strategy="eager")
     if proxy_url:
         kw["proxy"] = proxy_url.split("://", 1)[-1]  # SB 要 host:port
 
