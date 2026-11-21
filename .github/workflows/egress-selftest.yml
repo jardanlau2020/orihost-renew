@@ -1,0 +1,121 @@
+name: 家宽出口自测（openvpn）
+
+# 只为验证 scripts/openvpn_egress.py 在 GHA runner 上真能开隧道、真能换出口 IP。
+# 不碰续期、不碰面板、不写任何 secret。手动 dispatch 才跑。
+#
+# 为什么单独一个 workflow：renew.yml 正在 PR #5 里改，这里再动它会冲突。
+# 等 #5 合并后，把「起隧道 → 验 IP」这两步并进 renew.yml 即可，
+# 逻辑就是下面这几段，直接搬。
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: '地区关键字（KR / JP / MY），留空则取第一个可用节点'
+        required: false
+        default: 'KR'
+        type: string
+      keep_types:
+        description: 'filter_mihomo.py 是否保留住宅节点（调试用，默认 false）'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  egress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: 安装 openvpn + PyYAML
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends openvpn iproute2 curl
+          which openvpn || { echo "❌ openvpn 没装上"; exit 1; }
+          openvpn --version | head -1
+          pip install --quiet pyyaml
+          python -c "import yaml; print('pyyaml', yaml.__version__)"
+
+      - name: 还原订阅配置
+        env:
+          HOME_SUB_URL: ${{ secrets.HOME_SUB_URL }}
+          HOME_SUB_GZ: ${{ secrets.HOME_SUB_GZ }}
+        run: |
+          set -euo pipefail
+          if [ -n "${HOME_SUB_GZ:-}" ]; then
+            echo "📦 用 HOME_SUB_GZ 还原"
+            echo "$HOME_SUB_GZ" | base64 -d | gunzip > home_sub.yaml
+          elif [ -n "${HOME_SUB_URL:-}" ]; then
+            curl -fsSL --retry 2 --max-time 30 -o home_sub.yaml "$HOME_SUB_URL"
+          else
+            echo "⚪ 既无 HOME_SUB_GZ 也无 HOME_SUB_URL，无法自测"
+            exit 1
+          fi
+          python - <<'PY'
+          import yaml, collections
+          d = yaml.safe_load(open('home_sub.yaml', encoding='utf-8'))
+          px = d.get('proxies') or []
+          print('节点总数:', len(px))
+          print('类型分布:', dict(collections.Counter(p.get('type') for p in px)))
+          PY
+
+      - name: filter_mihomo.py 预检（预期 exit 2：住宅节点全丢）
+        run: |
+          set -uo pipefail
+          python scripts/filter_mihomo.py --check home_sub.yaml; rc=$?
+          echo "filter 退出码 = $rc"
+          if [ "$rc" = "2" ]; then
+            echo "✅ 符合预期：住宅节点是 openvpn，mihomo 解析不了 → 走 openvpn 直连"
+          elif [ "$rc" = "0" ]; then
+            echo "⚠️ 住宅节点没被丢，说明这份配置 mihomo 可能能吃；仍继续测 openvpn"
+          else
+            echo "❌ filter 异常退出"; exit 1
+          fi
+
+      - name: 列出可用住宅节点
+        run: python scripts/openvpn_egress.py --config home_sub.yaml --list | head -15
+
+      - name: 起 openvpn 隧道并验证出口 IP
+        env:
+          REGION: ${{ inputs.region }}
+        run: |
+          set -euo pipefail
+          DIRECT_IP="$(curl -s --max-time 10 https://api.ipify.org || true)"
+          echo "📡 直连出口 IP: ${DIRECT_IP:-未知}"
+
+          python scripts/openvpn_egress.py --config home_sub.yaml \
+            ${REGION:+--region "$REGION"} --out /tmp/node.ovpn
+
+          sudo openvpn --config /tmp/node.ovpn --daemon --log /tmp/ovpn.log
+          for i in $(seq 1 20); do
+            sleep 3
+            PROXY_IP="$(curl -s --max-time 8 https://api.ipify.org || true)"
+            [ -n "$PROXY_IP" ] && break
+          done
+          echo "📡 隧道出口 IP: ${PROXY_IP:-未知}"
+          echo "--- openvpn 日志尾部 ---"
+          sudo tail -20 /tmp/ovpn.log || true
+
+          if [ -z "${PROXY_IP:-}" ]; then
+            echo "❌ 隧道没起来"; exit 1
+          fi
+          if [ "$PROXY_IP" = "$DIRECT_IP" ]; then
+            echo "❌ 出口 IP 与直连相同，隧道没生效"; exit 1
+          fi
+          echo "✅ 家宽出口可用：$DIRECT_IP → $PROXY_IP"
+
+      - name: 收隧道
+        if: always()
+        run: |
+          sudo pkill -f 'openvpn --config /tmp/node.ovpn' || true
+          rm -f /tmp/node.ovpn /tmp/orihost-ovpn-auth-*.txt
+          echo "隧道已收"
