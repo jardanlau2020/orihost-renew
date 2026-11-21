@@ -296,11 +296,10 @@ def login(sb):
         # 只改这一处（CEO 控制变量）：run #85 的 300 秒卡死就在这里，
         # uc_open_with_reconnect 内部 driver.reconnect() 会把 chromedriver 弄死。
         sb.uc_open(BASE + "/")
-        # uc_open 的跳转是 call_me_later 延迟 5 秒，死等不可靠，轮询 URL 变化
-        for _ in range(15):
-            sb.sleep(0.5)
-            if "about:blank" not in (sb.get_current_url() or ""):
-                break
+        # uc_open 的跳转是 call_me_later 延迟 5 秒，等 3 秒足够。
+        # 不用 sb.current_url —— BaseCase 没有这个属性（run #86 就是踩在这），
+        # 要读 URL 得用 sb.get_current_url()。这轮不引入新变量，就睡 3 秒。
+        sb.sleep(3)
         if logged_in(sb):
             log("Cookie 登录成功")
             return
