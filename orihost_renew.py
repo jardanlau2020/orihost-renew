@@ -857,6 +857,12 @@ def _run_browser(kw, results, state):
 
         urls = server_urls(sb)
         log(f"找到 {len(urls)} 台服务器")
+        if not urls:
+            # 冷王 #87 指出：results 为空时 any(...) 为 False → exit 0 → 假绿。
+            # 一台都没枚举到必须判失败，否则「找不到服务器」会被看板当成成功。
+            log("❌ 一台服务器都没枚举到（登录状态或页面结构问题），本轮判失败")
+            results.append({"id": "-", "ok": False,
+                            "error": "一台服务器都没枚举到（登录状态或页面结构变化）"})
         step("逐台续期")
         for u in urls:
             sid = u.rsplit("/", 1)[-1]
