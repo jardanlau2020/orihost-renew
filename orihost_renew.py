@@ -289,7 +289,8 @@ def save_cookies(sb):
 
 
 def login(sb):
-    sb.uc_open_with_reconnect(BASE + "/", 4)
+    sb.uc_open(BASE + "/")
+    sb.sleep(3)  # uc_open 是 call_me_later 延迟 5 秒
     sb.sleep(3)
     if COOKIE:
         inject_cookie(sb)
@@ -310,7 +311,8 @@ def login(sb):
 
     if not (EMAIL and PASSWORD):
         raise RuntimeError("未登录且没有设置 ORIHOST_EMAIL / ORIHOST_PASSWORD")
-    sb.uc_open_with_reconnect(BASE + "/auth/login", 4)
+    sb.uc_open(BASE + "/auth/login")
+    sb.sleep(3)  # uc_open 是 call_me_later 延迟 5 秒
     sb.wait_for_element('input[type="password"]', timeout=40)
     try:
         sb.click("//button[normalize-space()='Got it']", by="xpath", timeout=2)
@@ -464,7 +466,8 @@ def safe_click(sb, xpath, timeout=20):
 
 
 def server_urls(sb):
-    sb.uc_open_with_reconnect(BASE + "/", 3)
+    sb.uc_open(BASE + "/")
+    sb.sleep(3)  # uc_open 是 call_me_later 延迟 5 秒
     try:
         sb.wait_for_element("a[href*='/server/']", timeout=40)
     except Exception:
@@ -569,7 +572,8 @@ def ensure_running(sb, sid, rec):
 
 
 def open_server(sb, url):
-    sb.uc_open_with_reconnect(url, 3)
+    sb.uc_open(url)
+    sb.sleep(3)  # uc_open 是 call_me_later 延迟 5 秒
     end = time.time() + 40
     while time.time() < end and renewal_days(sb) is None:
         sb.sleep(1)
