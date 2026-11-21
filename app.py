@@ -14,6 +14,7 @@ import random
 import html
 import base64
 import requests
+from urllib.parse import quote as _url_quote
 from datetime import datetime, timedelta, timezone
 from playwright.sync_api import sync_playwright
 
@@ -643,13 +644,29 @@ def panel_api(page, method, path, body=None):
         return None
 
 
+def read_turnstile_token(page):
+    """讀頁面上已生成嘅 Turnstile token。
+
+    2026-11-21：面板 complete 接口強制要 `?cf-turnstile-response=`，冇 token
+    一律回 400（run 44790025658 實證：renew/begin 200、complete 400）。
+    呢個函數**只讀**頁面已 render 嘅 widget 值，唔會自己觸發挑戰、唔會撳掣。
+    """
+    try:
+        return page.evaluate(
+            "() => { const el = document.querySelector('[name=cf-turnstile-response]');"
+            " return el ? (el.value || '') : ''; }") or ""
+    except Exception as e:
+        log(f"   ⚠️ 讀 Turnstile token 異常（{type(e).__name__}）: {str(e)[:120]}")
+        return ""
+
+
 def api_renew(page, sid):
     """接口續期：renew/begin → 等 dwell → renewal/complete。
     成功回傳 True；任何失敗回傳 None（交返 watchdog 提醒／頁面流程）。"""
     r = panel_api(page, "POST", f"/api/client/servers/{sid}/renew/begin")
     st = (r or {}).get("status")
     if st != 200:
-        log(f"   ⚠️ 接口 renew/begin 回 {st}：{str((r or {}).get('text',''))[:140]}")
+        log(f"   ⚠️ 接口 renew/begin 回 {st}：{str((r or {}).get('text',''))[:300]}")
         return None
     dwell = 15
     try:
@@ -658,15 +675,28 @@ def api_renew(page, sid):
         pass
     log(f"   ↻ 接口續期已開始，等 {dwell + 2}s（模擬讀文章）")
     time.sleep(min(dwell, 120) + 2)
-    r2 = panel_api(page, "GET", "/api/client/renewal/complete")
+    # 2026-11-21：complete 必須帶 cf-turnstile-response，否則面板回 400
+    # （前端自己係 `complete?cf-turnstile-response=<token>`，見 run 44790025658）。
+    token = read_turnstile_token(page)
+    qs = f"?cf-turnstile-response={_url_quote(token, safe='')}" if token else ""
+    if token:
+        log(f"   🔑 帶 Turnstile token（{len(token)} 字）呼叫 complete")
+    else:
+        log("   ⚠️ 頁面無 Turnstile token，complete 缺 cf-turnstile-response（面板會回 400）")
+    r2 = panel_api(page, "GET", f"/api/client/renewal/complete{qs}")
+    body = str((r2 or {}).get("text", "") or "")
     try:
-        d = json.loads((r2 or {}).get("text") or "{}")
+        d = json.loads(body or "{}")
     except Exception:
         d = {}
     _st2 = (r2 or {}).get("status")
     log(f"   ↻ renewal/complete 回 {_st2}，renewed={d.get('renewed_count')} skipped={d.get('skipped_count')}")
-    if (r2 or {}).get("status") == 200 and (d.get("renewed_count") or 0) > 0:
+    if _st2 != 200:
+        log(f"   ⚠️ complete 非 200，回應 body：{body[:300]}")
+        return None
+    if (d.get("renewed_count") or 0) > 0:
         return True
+    log(f"   ⚠️ complete 回 200 但 renewed_count=0，回應：{body[:200]}")
     return None
 
 
@@ -1096,8 +1126,9 @@ def main():
                                                old_due, old_due, current_ip)
                     sys.exit(0)
                 if window_open:
-                    # 2026-11-05：窗口開 → 先試「接口續期」（唔使 Turnstile）
-                    log("🔓 窗口開咗 → 試接口續期（繞過 Turnstile）")
+                    # 2026-11-05：窗口開 → 先試「接口續期」（renew/begin → dwell → complete）
+                    # 2026-11-21：complete 要帶 cf-turnstile-response，冇 token 面板回 400
+                    log("🔓 窗口開咗 → 試接口續期（需頁面 Turnstile token）")
                     if api_renew(page, SERVER_SHORT_ID):
                         new_days = get_renewal_days(page)
                         new_due = f"剩余 {new_days} 天" if new_days is not None else "已續期"
