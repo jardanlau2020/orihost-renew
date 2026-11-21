@@ -414,18 +414,20 @@ def step(name):
     log(f"▶ {name}")
 
 
-def start_heartbeat(sb, interval=20):
-    """后台线程每 interval 秒打一行心跳：当前步骤 + window_handles 数。
-    卡住时至少知道死在哪一步，不用再靠猜。"""
+def start_heartbeat(interval=20):
+    """后台线程每 interval 秒打一行心跳：当前步骤 + 已耗时。
+
+    2026-11-21（冷王）：这里**不碰 sb.driver**。Selenium 的 client 不是线程安全的，
+    心跳线程和主线程共用同一个 HTTP session 会互相插队，可能抛
+    invalid session id，也可能把主线程正在等的响应吃掉（表现为偶发卡住）——
+    那正好会污染我们加心跳要诊断的现象。心跳只回答「死在哪一步、跑了多久」。
+    """
     stop = threading.Event()
+    t0 = time.time()
 
     def _beat():
         while not stop.wait(interval):
-            try:
-                n = len(sb.driver.window_handles)
-            except Exception as e:
-                n = f"不可用({type(e).__name__})"
-            log(f"💓 心跳：步骤={_STEP['name']} windows={n}")
+            log(f"💓 心跳：步骤={_STEP['name']} 已耗时={int(time.time() - t0)}s")
 
     t = threading.Thread(target=_beat, daemon=True)
     t.start()
@@ -828,7 +830,7 @@ def _run_browser(kw, results, state):
                 "driver 启动后连不上（window_handles 失败）→ 检查 Xvfb / Chrome / "
                 "图形依赖；workflow 必须用 xvfb-run 包住 python 命令")
         log("✅ driver 健康检查通过")
-        hb_stop = start_heartbeat(sb)
+        hb_stop = start_heartbeat()
         step("登录")
         try:
             login(sb)
