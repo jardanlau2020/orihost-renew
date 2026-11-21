@@ -40,7 +40,28 @@ jobs:
         run: |
           pip install -r requirements.txt
           sudo apt-get update -y
-          sudo apt-get install -y xvfb
+          # SeleniumBase 的 uc 模式用 headless=False + 外部 Xvfb，缺 Xvfb 或图形库
+          # 就会「driver 连接 localhost:port 被拒」，所以这里一次装齐。
+          # 注意：xvfb-run 不是独立 apt 包，它随 xvfb 一起装（run #78 踩过：
+          # E: Unable to locate package xvfb-run）。
+          sudo apt-get install -y xvfb x11-utils libgbm1 libasound2t64 fonts-noto-cjk
+          # 不许静默失败：run #73 这步日志是空的，Xvfb 到底装没装没人知道
+          which Xvfb || { echo "❌ Xvfb 没装上"; exit 1; }
+          which xvfb-run || { echo "❌ xvfb-run 没装上"; exit 1; }
+          Xvfb -help 2>&1 | head -2
+
+      - name: 🔎 环境自检
+        # run #73 卡在 localhost:43457 connection refused，跑了 332 秒才超时。
+        # 先把 Xvfb / xvfb-run / chrome / seleniumbase 的存在打出来，起不来立刻失败。
+        run: |
+          set -e
+          echo "--- Xvfb ---"; command -v Xvfb || { echo "❌ 缺 Xvfb"; exit 1; }
+          echo "--- xvfb-run ---"; command -v xvfb-run || { echo "❌ 缺 xvfb-run"; exit 1; }
+          echo "--- chrome ---"; (google-chrome --version || chromium --version || echo "（暂无 chrome，SB 会自行安装）")
+          echo "--- seleniumbase ---"; python -c "import seleniumbase; print('seleniumbase', seleniumbase.__version__)"
+          # 记低实际装到的版本，下次排障直接对（CEO 要求）
+          pip show seleniumbase | sed -n 's/^Version: /seleniumbase pip version: /p'
+          python -c "import seleniumbase, os; print('site:', os.path.dirname(seleniumbase.__file__))"
 
       # ── 家宽出口（mihomo / Clash Meta）──────────────────────────────
       # Orihost 会记录续期来源 IP，GHA 机房 IP 属于按 IP 风控的典型特征，
@@ -84,7 +105,9 @@ jobs:
           # 清理会让 mihomo 解析失败的空字段（ss 节点的 tls-crypt / 空密码等）
           sed -i -E "/^[[:space:]]*tls-crypt:[[:space:]]*('{2}|\"{2})?[[:space:]]*$/d" ./mihomo-home/config.yaml
           echo "--- config.yaml 前 3 行 ---"; head -3 ./mihomo-home/config.yaml
-          echo "--- proxies 数量 ---"; grep -c "^  - name:" ./mihomo-home/config.yaml || true
+          # grep -c "^  - name:" 在真实配置上恒为 0（缩进/结构不同），会误判成没节点。
+          # 改用 yaml 真解析，排障时看到的数字才是真的。
+          echo "--- proxies 数量 ---"; python -c "import yaml;d=yaml.safe_load(open('./mihomo-home/config.yaml',encoding='utf-8'));print(len(d.get('proxies') or []))" || true
 
           nohup ./mihomo-bin -d ./mihomo-home -f ./mihomo-home/config.yaml > mihomo.log 2>&1 &
           echo "MIHOMO_PID=$!" >> "$GITHUB_ENV"
@@ -120,16 +143,28 @@ jobs:
           ORIHOST_PASSWORD: ${{ secrets.ORIHOST_PASSWORD }}
           ORIHOST_COOKIE: ${{ secrets.ORIHOST_COOKIE }}
           ORIHOST_REMEMBER: ${{ secrets.ORIHOST_REMEMBER }}
+          # 2026-11-21: 面板改版后 renewal/complete 需要 cf-turnstile-response，
+          # 无 token 必回 400。关掉接口捷径，强制走页面流程（那里有 pass_turnstile）。
+          API_RENEW: "1"   # 面板 bundle 无 Read Article/Claim Renewal，只能走接口 + Turnstile token
           NODE_LINK: ${{ secrets.NODE_LINK }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           set -o pipefail
           which Xvfb || { echo "❌ Xvfb 没装上"; exit 1; }
+          which xvfb-run || { echo "❌ xvfb-run 没装上"; exit 1; }
           echo "DISPLAY 由 xvfb-run 提供"
-          timeout 900 xvfb-run -a --server-args="-screen 0 1920x1080x24"             python orihost_renew.py 2>&1 | tee raw.log
-          rc=${PIPESTATUS[0]}
+          # 上限 600 秒 + -k 10：run #82 是活着跑到 300 秒被掐（exit 124），
+          # 说明 300 秒不够走完登录+续期；-k 保证超时后连子进程一起收。
+          # tee 移出管道：`timeout ... | tee` 只杀 timeout 那一侧，python 和 tee
+          # 可能变成孤儿继续跑，导致这一步超时不退。先重定向，结束后再 tail。
+          set +e
+          timeout -k 10 600 xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            python orihost_renew.py > raw.log 2>&1
+          rc=$?
           echo "python exit code: $rc"
+          echo "--- raw.log 尾部 120 行 ---"
+          tail -120 raw.log || true
           exit $rc
 
       - name: 💾 回写 ORIHOST_COOKIE

@@ -20,6 +20,8 @@ import json
 import os
 import re
 import sys
+from urllib.parse import quote
+import threading
 import time
 from datetime import datetime
 
@@ -75,9 +77,17 @@ COOKIE_OUT = os.getenv("COOKIE_OUT", "cookie.txt")
 
 TS_IFRAME = 'iframe[src*="challenges.cloudflare.com"]'
 MAX_DAYS = int(os.environ.get("MAX_DAYS", "21"))
-X_RENEW = "//button[normalize-space()='Renew']"
-X_READ = "//button[contains(normalize-space(),'Read Article')]"
-X_CLAIM = "//button[contains(normalize-space(),'Claim Renewal')]"
+# 2026-11-21（#90 dump 实锤）：面板真实按钮文案是 `Renew server`，上游用
+# normalize-space()='Renew' 精确匹配，多一个词就永远匹配不到 -> 九轮下来弹窗
+# 一次都没打开，Turnstile 自然也没出现过（iframes=0 / modal 空）。
+# 改成 contains，并排除上限态按钮，避免把 "Renew Limit Reached" 当成可续期。
+X_RENEW = "//button[contains(normalize-space(),'Renew') and not(contains(normalize-space(),'Limit'))]"
+X_READ = ("//button[contains(translate(normalize-space()," 
+          "    'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')," 
+          "    'read article')]")
+X_CLAIM = ("//button[contains(translate(normalize-space()," 
+           "    'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')," 
+           "    'claim')]")
 X_SIGNIN = "//button[@type='submit' or contains(normalize-space(),'Sign In')]"
 
 
@@ -99,19 +109,46 @@ def credential_path() -> str:
 # ---------------------------------------------------------------- 网络
 
 def setup_network():
-    """返回 (本地代理URL或None, 脱敏出口IP, 模式)。代理失败回落直连。"""
+    """返回 (本地代理URL或None, 脱敏出口IP, 模式)。
+
+    2026-11-21 改：不再「没家宽就偷偷用 NODE_LINK 降级」。机房 IP 去续期是
+    风险最高的跑法（Cloudflare 一眼看穿，Turnstile 必挂），所以要显式：
+      - NODE_PROXY_URL 有值（workflow 起好 mihomo）→ 先验端口，不通就抛错
+      - 没 NODE_PROXY_URL 但配了 HOME_SUB_URL → workflow 该起却没起来，抛错
+      - 两者都没有 → 明确以「无代理」跑，日志写清楚
+      - 想用 NODE_LINK 走 sing-box，必须显式设 ORIHOST_USE_NODE_LINK=1
+    """
     ext = os.getenv("NODE_PROXY_URL", "").strip()
-    if ext:  # 前一步 gxjxzhoo/Node_Proxy Action 已起好代理
-        log("使用 Node_Proxy Action 提供的本地代理")
+    home = (os.getenv("HOME_SUB_URL", "").strip()
+            or os.getenv("HOME_SUB_GZ", "").strip())
+    if ext:
+        host_port = ext.split("://", 1)[-1]
+        try:
+            import socket
+            host, port = host_port.rsplit(":", 1)
+            with socket.create_connection((host, int(port)), timeout=3):
+                pass
+        except Exception as e:
+            raise RuntimeError(
+                f"代理端口不通（{host_port}）：{e} → 不降级直连，先修代理")
+        log(f"使用家宽出口：{ext}")
         return ext, os.getenv("NODE_PROXY_IP", "") or "未知", "代理"
-    if NODE_LINK.strip():
+
+    if home:
+        raise RuntimeError(
+            "配了 HOME_SUB_URL / HOME_SUB_GZ 但 workflow 没起 mihomo（NODE_PROXY_URL 为空）"
+            " → 不降级直连，先修 workflow")
+
+    if os.getenv("ORIHOST_USE_NODE_LINK", "").strip().lower() in ("1", "true", "yes") and NODE_LINK.strip():
         try:
             proxy, ip, _ = setup_node_proxy(NODE_LINK, workdir=os.getenv("RUNNER_TEMP", "/tmp"))
-            return proxy, ip or "未知", "代理"
+            return proxy, ip or "未知", "代理(NODE_LINK)"
         except Exception as e:
-            log("代理启动失败，回落直连：", e)
-            return None, probe_exit_ip() or "未知", "直连(代理失败)"
-    return None, probe_exit_ip() or "未知", "直连"
+            raise RuntimeError(f"NODE_LINK 代理起不来：{e} → 不降级直连") from e
+
+    log("⚠️ 未配置 HOME_SUB_URL / HOME_SUB_GZ：以无代理模式运行"
+        "（出口=机房 IP，Turnstile 可能必挂）")
+    return None, probe_exit_ip() or "未知", "无代理"
 
 
 # ---------------------------------------------------------------- Turnstile
@@ -188,16 +225,19 @@ def click_turnstile_box(sb):
     sb.uc_gui_click_x_y(x, y)
 
 
-def pass_turnstile(sb, wait_btn_xpath, timeout=90, detach=False):
+def pass_turnstile(sb, wait_btn_xpath, timeout=90, detach=False, require_token=False):
     """系统级鼠标点 Turnstile，直到目标按钮可点或拿到 token。
-    detach=True: 用于页面内动态弹出的 Turnstile, 先断开 webdriver 重新渲染再点。"""
+    detach=True: 用于页面内动态弹出的 Turnstile, 先断开 webdriver 重新渲染再点。
+    require_token=True: 只认 ts_token 非空。X_RENEW 改成 contains 之后它一直是
+    可点状态，用它当判据会立刻返回 True（点击 0 次）造成假阳性，接口续期那条路
+    必须只看 token。"""
     end = time.time() + 20
     while time.time() < end and not sb.is_element_present(TS_IFRAME):
         sb.sleep(1)
     sb.sleep(3)
     start, clicks = time.time(), 0
     while time.time() - start < timeout:
-        if btn_enabled(sb, wait_btn_xpath) or ts_token(sb):
+        if ts_token(sb) or (not require_token and btn_enabled(sb, wait_btn_xpath)):
             log(f"Turnstile 已通过（点击 {clicks} 次）")
             return True
         if clicks < 4 and (clicks == 0 or time.time() - start > clicks * 20):
@@ -261,12 +301,20 @@ def save_cookies(sb):
 
 
 def login(sb):
-    sb.uc_open_with_reconnect(BASE + "/", 4)
+    # 不走 reconnect：它内部 driver.reconnect() 在 GHA 上会弄死 chromedriver
+    # （#82/#85 卡 300s，#87 换成 uc_open 后登录立刻通过）。
+    sb.uc_open(BASE + "/")
+    sb.sleep(3)  # uc_open 是 call_me_later 延迟 5 秒跳转
     sb.sleep(3)
     if COOKIE:
         inject_cookie(sb)
-        sb.uc_open_with_reconnect(BASE + "/", 3)
-        sb.sleep(4)
+        # 只改这一处（CEO 控制变量）：run #85 的 300 秒卡死就在这里，
+        # uc_open_with_reconnect 内部 driver.reconnect() 会把 chromedriver 弄死。
+        sb.uc_open(BASE + "/")
+        # uc_open 的跳转是 call_me_later 延迟 5 秒，等 3 秒足够。
+        # 不用 sb.current_url —— BaseCase 没有这个属性（run #86 就是踩在这），
+        # 要读 URL 得用 sb.get_current_url()。这轮不引入新变量，就睡 3 秒。
+        sb.sleep(3)
         if logged_in(sb):
             log("Cookie 登录成功")
             return
@@ -277,7 +325,8 @@ def login(sb):
 
     if not (EMAIL and PASSWORD):
         raise RuntimeError("未登录且没有设置 ORIHOST_EMAIL / ORIHOST_PASSWORD")
-    sb.uc_open_with_reconnect(BASE + "/auth/login", 4)
+    sb.uc_open(BASE + "/auth/login")
+    sb.sleep(3)
     sb.wait_for_element('input[type="password"]', timeout=40)
     try:
         sb.click("//button[normalize-space()='Got it']", by="xpath", timeout=2)
@@ -353,8 +402,61 @@ def kill_overlays(sb):
         return 0
 
 
+def driver_alive(sb) -> bool:
+    """driver 还活着吗。2026-11-21：run #73 就是半路 driver 死掉，
+    之后任何 window_handles 调用都抛 Connection refused 收场。"""
+    try:
+        sb.driver.window_handles
+        return True
+    except Exception:
+        return False
+
+
+def driver_call(sb, fn, *args, **kwargs):
+    """调 WebDriver；连接被拒（driver 半路死）时等 2 秒重试一次。"""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        msg = str(e)
+        if not any(k in msg for k in ("Connection refused", "MaxRetryError",
+                                      "NewConnectionError", "localhost")):
+            raise
+        log("⚠️ driver 连接被拒，2 秒后重试一次")
+        time.sleep(2)
+        return fn(*args, **kwargs)
+
+
+_STEP = {"name": "启动"}
+
+
+def step(name):
+    """标记当前步骤，心跳日志会带出来（run #82 黑箱 4 分 49 秒的教训）。"""
+    _STEP["name"] = name
+    log(f"▶ {name}")
+
+
+def start_heartbeat(interval=20):
+    """后台线程每 interval 秒打一行心跳：当前步骤 + 已耗时。
+
+    2026-11-21（冷王）：这里**不碰 sb.driver**。Selenium 的 client 不是线程安全的，
+    心跳线程和主线程共用同一个 HTTP session 会互相插队，可能抛
+    invalid session id，也可能把主线程正在等的响应吃掉（表现为偶发卡住）——
+    那正好会污染我们加心跳要诊断的现象。心跳只回答「死在哪一步、跑了多久」。
+    """
+    stop = threading.Event()
+    t0 = time.time()
+
+    def _beat():
+        while not stop.wait(interval):
+            log(f"💓 心跳：步骤={_STEP['name']} 已耗时={int(time.time() - t0)}s")
+
+    t = threading.Thread(target=_beat, daemon=True)
+    t.start()
+    return stop
+
+
 def close_extra_tabs(sb, main):
-    for h in list(sb.driver.window_handles):
+    for h in list(driver_call(sb, lambda: sb.driver.window_handles)):
         if h != main:
             try:
                 sb.driver.switch_to.window(h)
@@ -378,7 +480,8 @@ def safe_click(sb, xpath, timeout=20):
 
 
 def server_urls(sb):
-    sb.uc_open_with_reconnect(BASE + "/", 3)
+    sb.uc_open(BASE + "/")   # 不走 reconnect（同上）
+    sb.sleep(3)
     try:
         sb.wait_for_element("a[href*='/server/']", timeout=40)
     except Exception:
@@ -483,7 +586,8 @@ def ensure_running(sb, sid, rec):
 
 
 def open_server(sb, url):
-    sb.uc_open_with_reconnect(url, 3)
+    sb.uc_open(url)   # 不走 reconnect；后面 renewal_days 轮询会等页面到位
+    sb.sleep(3)
     end = time.time() + 40
     while time.time() < end and renewal_days(sb) is None:
         sb.sleep(1)
@@ -527,6 +631,11 @@ def read_article(sb, sid, main):
     kill_overlays(sb)
 
 
+# 2026-11-21：面板 bundle 里 `Read Article` / `Claim Renewal` 命中 0 次
+# （1456800 字节主包），页面点击流程是写给旧面板的，永远匹配不到。
+# 真实路径是接口：renew/begin(200) → 过 Turnstile 拿 token → renewal/complete
+# 带上 ?cf-turnstile-response=<token>。所以接口续期默认开启。
+# 临时要退回页面流程（排查用）：API_RENEW=0。
 API_RENEW = os.getenv("API_RENEW", "1").strip().lower() not in ("0", "false", "no", "")
 
 
@@ -547,12 +656,52 @@ def api_renew(sb, sid, url, before):
             dwell = 15
         log(f"{sid}: 接口续期已开始，等待 {dwell + 2}s")
         time.sleep(min(dwell, 120) + 2)
-        r2 = panel_api(sb, "GET", "/api/client/renewal/complete")
+        # complete 需要 cf-turnstile-response（#88：不带就固定回 400）。
+        # 先读页面上现成的 token；没有就用 pass_turnstile（系统级鼠标 + 断 webdriver
+        # 重渲染）现场过盾再读——阿滨试过 turnstile.render() 等回调，45 秒拿不到，
+        # 能过的只有上游这套。
+        token = ""
         try:
-            d = json.loads(r2.get("text") or "{}")
-        except Exception:
+            open_server(sb, url)
+            sb.sleep(2)
+            token = ts_token(sb) or ""
+            if not token:
+                # #90 实锤：Renew 按钮一直没被点到，弹窗没开，所以页面上
+                # iframes=0、modal 空、Turnstile 根本不存在。先点开弹窗再找盾。
+                log(f"{sid}: 页面没有现成 token，先点开续期弹窗")
+                try:
+                    safe_click(sb, X_RENEW, timeout=15)
+                except Exception as e:
+                    log(f"{sid}: 点 Renew 打开弹窗失败 {type(e).__name__}: {str(e)[:120]}")
+                sb.sleep(3)
+                dump_buttons(sb, f"{sid}-弹窗")
+                token = ts_token(sb) or ""
+            if not token:
+                log(f"{sid}: 弹窗里没有现成 token，走 pass_turnstile 过盾")
+                try:
+                    pass_turnstile(sb, X_RENEW, detach=True, timeout=60, require_token=True)
+                except Exception as e:
+                    log(f"{sid}: pass_turnstile 异常 {type(e).__name__}: {str(e)[:120]}")
+                token = ts_token(sb) or ""
+        except Exception as e:
+            log(f"{sid}: 取 Turnstile token 异常 {type(e).__name__}: {str(e)[:150]}")
+        log(f"{sid}: Turnstile token 长度={len(token)}")
+
+        qs = ("?cf-turnstile-response=" + quote(token, safe="")) if token else ""
+        try:
+            r2 = panel_api(sb, "GET", f"/api/client/renewal/complete{qs}")
+        except Exception as e:
+            log(f"{sid}: complete 调用异常 {type(e).__name__}: {str(e)[:200]}")
+            return None
+        log(f"{sid}: complete 原始返回 status={r2.get('status') if r2 else None} "
+            f"body={((r2 or {}).get('text') or '')[:500]}")
+        try:
+            d = json.loads((r2 or {}).get("text") or "{}")
+        except Exception as e:
+            log(f"{sid}: complete body 不是 JSON：{type(e).__name__}: {str(e)[:120]}")
             d = {}
-        log(f"{sid}: complete 返回 {r2.get('status') if r2 else None}，renewed={d.get('renewed_count')} skipped={d.get('skipped_count')}")
+        log(f"{sid}: complete 解析后 renewed={d.get('renewed_count')} "
+            f"skipped={d.get('skipped_count')}")
         if not (r2 and r2.get("status") == 200 and (d.get("renewed_count") or 0) > 0):
             return None
         after = open_server(sb, url)
@@ -565,6 +714,47 @@ def api_renew(sb, sid, url, before):
     except Exception as e:
         log(f"{sid}: 接口续期异常 {type(e).__name__}，改用页面流程")
         return None
+
+
+def dump_buttons(sb, tag=""):
+    """dump 页面结构：buttons / 含 renew|read|claim|article 的 links / iframe 数 / url / 弹窗文本。
+
+    2026-11-21：九轮下来连 Renew 按钮长什么样都不知道。这个 dump 挂在失败路径上，
+    任何一步抛异常都会打印，用来定位「选择器对不上」还是「弹窗压根没打开」。
+    """
+    try:
+        info = sb.execute_script(
+            "return {"
+            "buttons: Array.from(document.querySelectorAll('button'))"
+            ".map(function(b){return (b.textContent||'').trim()})"
+            ".filter(function(t){return t}).slice(0,50),"
+            "links: Array.from(document.querySelectorAll('a'))"
+            ".map(function(a){return (a.textContent||'').trim()})"
+            ".filter(function(t){return t}).slice(0,80),"
+            "iframes: document.querySelectorAll('iframe').length,"
+            "url: location.href,"
+            "modal: (function(){"
+            "var s=['.ReactModal__Content','div[role=\"dialog\"]','[aria-modal=\"true\"]',"
+            "'[class*=\"odal\"]','[class*=\"ialog\"]'];"
+            "for(var i=0;i<s.length;i++){var e=null;"
+            "try{e=document.querySelector(s[i]);}catch(x){continue;}"
+            "var t=e?(e.innerText||'').trim():'';"
+            "if(t) return s[i]+' => '+t.slice(0,500);}"
+            "return '';})(),"
+            "disabled: Array.from(document.querySelectorAll('button'))"
+            ".filter(function(b){return b.disabled;})"
+            ".map(function(b){return (b.textContent||'').trim()}).slice(0,20)};")
+        links = info.get("links") or []
+        hit = [t for t in links
+               if any(k in t.lower() for k in ("renew", "read", "claim", "article"))]
+        log(f"🔎 dump{('[' + tag + ']') if tag else ''} url={info.get('url')}")
+        log(f"🔎 dump buttons={info.get('buttons')}")
+        log(f"🔎 dump iframes={info.get('iframes')}")
+        log(f"🔎 dump disabled={info.get('disabled')}")
+        log(f"🔎 dump modal={(info.get('modal') or '')[:400]}")
+        log(f"🔎 dump links含renew/read/claim={hit}")
+    except Exception as e:
+        log(f"🔎 dump 失败：{type(e).__name__}: {e}")
 
 
 def renew(sb, url):
@@ -592,6 +782,8 @@ def renew(sb, url):
             kill_overlays(sb)
         safe_click(sb, X_RENEW)
         sb.sleep(2)
+        # 弹窗开没开、里面有哪些按钮/iframe，一次打出来（#90 之前一直在猜选择器）
+        dump_buttons(sb, f"{sid}-Renew后")
         close_extra_tabs(sb, main)
 
         for i in range(3):  # 广告可能吃掉 Read Article 的点击, 最多点 3 次
@@ -610,6 +802,7 @@ def renew(sb, url):
                 txt = "?"
             if "CSRF token mismatch" in txt:
                 raise RuntimeError("CSRF token mismatch")
+            dump_buttons(sb, f"第{i + 1}次")
             log(f"{sid}: 第 {i + 1} 次阅读后没出现 Claim Renewal（弹窗：{txt}），重试")
             sb.save_screenshot(f"fail_{sid}_read{i + 1}.png")
             close_extra_tabs(sb, main)
@@ -724,80 +917,146 @@ def tg_send(text):
 
 # ---------------------------------------------------------------- main
 
+def driver_error(e) -> bool:
+    """是不是「驱动/浏览器起不来」那类错（区别于业务失败）。"""
+    msg = str(e) or type(e).__name__
+    return any(k in msg for k in (
+        "Connection refused", "MaxRetryError", "NewConnectionError", "localhost",
+        "WebDriver", "chromedriver", "session not created", "DevToolsActivePort"))
+
+
+def _run_browser(kw, results, state):
+    """开一只浏览器跑完整流程。driver 起不来就抛，由 main 决定是否重开。"""
+    from seleniumbase import SB
+    with SB(**kw) as sb:
+        # 元素等待上限收到 20 秒：上一轮 driver 起不来时跑到 332 秒才超时，
+        # 那是驱动连接层的问题，不该让每个 wait 都按默认 30-60 秒慢慢熬。
+        try:
+            sb.set_default_timeout(20)
+        except Exception:
+            pass
+        # driver 健康检查：run #73 就是「SB 起来了但浏览器没起来」，
+        # 之后第一次调 window_handles 才炸。这里先探一次，立刻定性。
+        if not driver_alive(sb):
+            raise RuntimeError(
+                "driver 启动后连不上（window_handles 失败）→ 检查 Xvfb / Chrome / "
+                "图形依赖；workflow 必须用 xvfb-run 包住 python 命令")
+        log("✅ driver 健康检查通过")
+        hb_stop = start_heartbeat()
+        step("登录")
+        try:
+            login(sb)
+        except Exception as e:
+            state["login_error"] = str(e).splitlines()[0] if str(e) else type(e).__name__
+            try:
+                sb.save_screenshot("fail_login.png")
+            except Exception:
+                pass
+            raise
+        save_cookies(sb)  # 登录成功立即导出，续期失败也不影响 cookie 更新
+        step("枚举服务器")
+
+        urls = server_urls(sb)
+        log(f"找到 {len(urls)} 台服务器")
+        if not urls:
+            # 冷王 #87 指出：results 为空时 any(...) 为 False → exit 0 → 假绿。
+            # 一台都没枚举到必须判失败，否则「找不到服务器」会被看板当成成功。
+            log("❌ 一台服务器都没枚举到（登录状态或页面结构问题），本轮判失败")
+            results.append({"id": "-", "ok": False,
+                            "error": "一台服务器都没枚举到（登录状态或页面结构变化）"})
+        step("逐台续期")
+        for u in urls:
+            sid = u.rsplit("/", 1)[-1]
+            rec = {"id": sid, "ok": False, "error": None, "before": None}
+            for attempt in range(1, 3):  # 每台最多 2 次
+                try:
+                    step(f"续期 {u.rsplit('/', 1)[-1]} 第{attempt}次")
+                    step(f"续期 {u.rsplit('/', 1)[-1]} 第{attempt}次")
+                    info = renew(sb, u)
+                    rec.update(info, ok=True)
+                    break
+                except Exception as e:
+                    msg = str(e).splitlines()[0][:300] if str(e).strip() else "页面元素未出现"
+                    if msg.startswith("Message:"):
+                        msg = "页面元素未出现（Claim Renewal / 按钮）"
+                    rec["error"] = msg
+                    dump_buttons(sb, f"{sid}失败{attempt}")
+                    log(f"{u} 第 {attempt} 次续期失败：{msg}")
+                    if "CSRF" in msg:  # 会话 token 不一致 -> 清 cookie 用账号密码重新登录
+                        log("CSRF 不一致，清除 cookie 后重新登录")
+                        global COOKIE
+                        COOKIE = ""
+                        sb.driver.delete_all_cookies()
+                        login(sb)
+                        save_cookies(sb)
+            if not rec["ok"]:
+                try:
+                    rec["before"] = renewal_days(sb)
+                    rec["status"], rec["uptime"] = server_info(sb, sid)
+                except Exception:
+                    pass
+            try:
+                ensure_running(sb, sid, rec)
+            except Exception as e:
+                log(f"{sid}: 自动开机异常 {type(e).__name__}")
+            results.append(rec)
+        save_cookies(sb)
+
+
 def main():
     log(f"凭证路径: {credential_path()}")
     from seleniumbase import SB
 
     proxy_url, ip, mode = setup_network()
     log(f"网络模式：{mode}，出口 IP：{ip}")
+    log(f"平台={sys.platform} DISPLAY={os.environ.get('DISPLAY') or '（空）'}")
+    # 2026-11-21：xvfb 交给 workflow 的 xvfb-run 显式管理（SB 自管那套在 GHA 上
+    # 起不来：driver 连 localhost:43457 被拒、332 秒才超时）。这里只要求有 DISPLAY。
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+        log("⚠️ DISPLAY 为空：headless=False 需要 Xvfb（workflow 用 xvfb-run 提供）")
     kw = dict(uc=True, test=True, headless=False, locale_code="en",
-              xvfb=sys.platform.startswith("linux"))
+              page_load_strategy="eager")
     if proxy_url:
         kw["proxy"] = proxy_url.split("://", 1)[-1]  # SB 要 host:port
 
-    results, login_error = [], None
+    results = []
+    state = {"login_error": None}
     try:
-        with SB(**kw) as sb:
+        # load藤 #73 要求：seleniumbase 报 localhost:port refused 时重启 driver 重试一次，
+        # 别整个 run 直接挂。这里直接重开整只浏览器（driver 半路死了重连不可靠）。
+        for attempt in (1, 2):
             try:
-                login(sb)
+                _run_browser(kw, results, state)
+                break
             except Exception as e:
-                login_error = str(e).splitlines()[0] if str(e) else type(e).__name__
-                try:
-                    sb.save_screenshot("fail_login.png")
-                except Exception:
-                    pass
+                if attempt == 1 and driver_error(e):
+                    log("⚠️ driver 起不来 / 半路死掉，重开浏览器重试一次")
+                    time.sleep(3)
+                    continue
                 raise
-            save_cookies(sb)  # 登录成功立即导出，续期失败也不影响 cookie 更新
-
-            urls = server_urls(sb)
-            log(f"找到 {len(urls)} 台服务器")
-            for u in urls:
-                sid = u.rsplit("/", 1)[-1]
-                rec = {"id": sid, "ok": False, "error": None, "before": None}
-                for attempt in range(1, 3):  # 每台最多 2 次
-                    try:
-                        info = renew(sb, u)
-                        rec.update(info, ok=True)
-                        break
-                    except Exception as e:
-                        msg = str(e).splitlines()[0][:300] if str(e).strip() else "页面元素未出现"
-                        if msg.startswith("Message:"):
-                            msg = "页面元素未出现（Claim Renewal / 按钮）"
-                        rec["error"] = msg
-                        log(f"{u} 第 {attempt} 次续期失败：{msg}")
-                        if "CSRF" in msg:  # 会话 token 不一致 -> 清 cookie 用账号密码重新登录
-                            log("CSRF 不一致，清除 cookie 后重新登录")
-                            global COOKIE
-                            COOKIE = ""
-                            sb.driver.delete_all_cookies()
-                            login(sb)
-                            save_cookies(sb)
-                if not rec["ok"]:
-                    try:
-                        rec["before"] = renewal_days(sb)
-                        rec["status"], rec["uptime"] = server_info(sb, sid)
-                    except Exception:
-                        pass
-                try:
-                    ensure_running(sb, sid, rec)
-                except Exception as e:
-                    log(f"{sid}: 自动开机异常 {type(e).__name__}")
-                results.append(rec)
-            save_cookies(sb)
     except Exception as e:
-        if not login_error:
-            login_error = None
-            results.append({"id": "-", "ok": False, "error": f"脚本异常：{str(e).splitlines()[0][:150]}"})
+        first = str(e).splitlines()[0] if str(e) else type(e).__name__
+        # 2026-11-21 run 44886971638：driver 连 localhost:43457 被拒、332 秒才超时。
+        # 那是环境问题（Xvfb/Chrome 没起来），不是业务失败，报错要说人话。
+        if driver_error(e):
+            first = (f"浏览器驱动起不来（{first[:100]}）→ 检查 Xvfb / Chrome / "
+                     f"图形依赖；headless=False 必须有可用的 Xvfb")
+        if state["login_error"] is None:
+            results.append({"id": "-", "ok": False, "error": f"脚本异常：{first[:200]}"})
         log("运行异常：", e)
     finally:
         try:
-            tg_send(build_report(mode, ip, results, login_error))
+            hb_stop.set()
+        except Exception:
+            pass
+        try:
+            tg_send(build_report(mode, ip, results, state["login_error"]))
         except Exception as e:
             log("生成/发送报告失败：", e)
 
     ok = sum(1 for r in results if r["ok"])
     log(f"完成：{ok}/{len(results)} 台成功续期")
-    sys.exit(1 if login_error or any(not r["ok"] for r in results) else 0)
+    sys.exit(1 if state["login_error"] or any(not r["ok"] for r in results) else 0)
 
 
 if __name__ == "__main__":
