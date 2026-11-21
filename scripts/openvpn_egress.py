@@ -25,7 +25,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import tempfile
 
 import yaml
 
@@ -48,7 +50,7 @@ def load_nodes(path: str):
     return out
 
 
-def render_ovpn(n: dict) -> str:
+def render_ovpn(n: dict, auth_path: str = "") -> str:
     name = str(n.get("name") or "node")
     proto = str(n.get("proto") or "tcp").lower()
     lines = [
@@ -72,8 +74,8 @@ def render_ovpn(n: dict) -> str:
     ]
     if str(n.get("udp", "")).lower() in ("true", "1"):
         lines = [l for l in lines if not l.startswith("proto ")] + ["proto udp"]
-    if n.get("username") or n.get("password"):
-        lines.append("auth-user-pass auth.txt")
+    if auth_path:
+        lines.append(f"auth-user-pass {auth_path}")
     body = ["<ca>", str(n["ca"]).strip(), "</ca>",
             "<cert>", str(n["cert"]).strip(), "</cert>",
             "<key>", str(n["key"]).strip(), "</key>"]
@@ -125,13 +127,28 @@ def main(argv=None) -> int:
         print(f"[ovpn] 可选：{[x.get('name') for x in nodes[:10]]}", file=sys.stderr)
         return 1
 
-    text = render_ovpn(n)
+    # 2026-11-21（冷王 review 第 ③ 条）：账号密码不能写进仓库检出目录。
+    # 原来写 ./auth.txt，会留在 $GITHUB_WORKSPACE 里；改到 /tmp 且 chmod 600，
+    # .ovpn 里用绝对路径引用。
+    auth_path = ""
+    if n.get("username") or n.get("password"):
+        # 用 tempfile.gettempdir()：Linux/GHA 上是 /tmp，本机 Windows 上也能跑，
+        # 不写进仓库检出目录。
+        auth_path = os.path.join(
+            tempfile.gettempdir(), f"orihost-ovpn-auth-{os.getpid()}.txt")
+        fd = os.open(auth_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"{n.get('username') or 'vpn'}\n{n.get('password') or 'vpn'}\n")
+        try:
+            os.chmod(auth_path, 0o600)
+        except Exception:
+            pass  # Windows 上 chmod 语义有限，不影响功能
+        print(f"[ovpn] 🔐 账号文件写到 {auth_path}（600，不进工作区）")
+
+    text = render_ovpn(n, auth_path)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(text)
-        # auth.txt 单独放，权限收一下
-        with open("auth.txt", "w", encoding="utf-8") as f:
-            f.write(f"{n.get('username') or 'vpn'}\n{n.get('password') or 'vpn'}\n")
         print(f"[ovpn] ✅ 已生成 {args.out}（节点 {n.get('name')} {n.get('server')}:{n.get('port')}）")
         print("[ovpn] 起隧道：sudo openvpn --config " + args.out + " --daemon --log /tmp/ovpn.log")
         print("[ovpn] 验证出口：curl -s --max-time 15 https://api.ipify.org")
