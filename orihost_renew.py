@@ -733,15 +733,25 @@ def dump_buttons(sb, tag=""):
             ".filter(function(t){return t}).slice(0,80),"
             "iframes: document.querySelectorAll('iframe').length,"
             "url: location.href,"
-            "modal: ((document.querySelector('.ReactModal__Content')||{})"
-            ".innerText || '')};")
+            "modal: (function(){"
+            "var s=['.ReactModal__Content','div[role=\"dialog\"]','[aria-modal=\"true\"]',"
+            "'[class*=\"odal\"]','[class*=\"ialog\"]'];"
+            "for(var i=0;i<s.length;i++){var e=null;"
+            "try{e=document.querySelector(s[i]);}catch(x){continue;}"
+            "var t=e?(e.innerText||'').trim():'';"
+            "if(t) return s[i]+' => '+t.slice(0,500);}"
+            "return '';})(),"
+            "disabled: Array.from(document.querySelectorAll('button'))"
+            ".filter(function(b){return b.disabled;})"
+            ".map(function(b){return (b.textContent||'').trim()}).slice(0,20)};")
         links = info.get("links") or []
         hit = [t for t in links
                if any(k in t.lower() for k in ("renew", "read", "claim", "article"))]
         log(f"🔎 dump{('[' + tag + ']') if tag else ''} url={info.get('url')}")
         log(f"🔎 dump buttons={info.get('buttons')}")
         log(f"🔎 dump iframes={info.get('iframes')}")
-        log(f"🔎 dump modal={(info.get('modal') or '')[:300]}")
+        log(f"🔎 dump disabled={info.get('disabled')}")
+        log(f"🔎 dump modal={(info.get('modal') or '')[:400]}")
         log(f"🔎 dump links含renew/read/claim={hit}")
     except Exception as e:
         log(f"🔎 dump 失败：{type(e).__name__}: {e}")
