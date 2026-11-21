@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+from urllib.parse import quote
 import threading
 import time
 from datetime import datetime
@@ -619,12 +620,12 @@ def read_article(sb, sid, main):
     kill_overlays(sb)
 
 
-# 2026-11-21 run #88：renew/begin 200，但 renewal/complete 固定回 400
-# （面板要求 ?cf-turnstile-response=<token>，上游没带）。阿滨早期试过主动渲染
-# Turnstile 等 token，45 秒拿不到，那条路走死了。所以默认关掉接口续期，
-# 强制走页面流程——页面流程里的 pass_turnstile() 用系统级鼠标点 + 断开重渲染，
-# 是上游能过 CF 的那条路。要重新启用接口续期：API_RENEW=1。
-API_RENEW = os.getenv("API_RENEW", "0").strip().lower() in ("1", "true", "yes")
+# 2026-11-21：面板 bundle 里 `Read Article` / `Claim Renewal` 命中 0 次
+# （1456800 字节主包），页面点击流程是写给旧面板的，永远匹配不到。
+# 真实路径是接口：renew/begin(200) → 过 Turnstile 拿 token → renewal/complete
+# 带上 ?cf-turnstile-response=<token>。所以接口续期默认开启。
+# 临时要退回页面流程（排查用）：API_RENEW=0。
+API_RENEW = os.getenv("API_RENEW", "1").strip().lower() not in ("0", "false", "no", "")
 
 
 def api_renew(sb, sid, url, before):
@@ -644,10 +645,29 @@ def api_renew(sb, sid, url, before):
             dwell = 15
         log(f"{sid}: 接口续期已开始，等待 {dwell + 2}s")
         time.sleep(min(dwell, 120) + 2)
-        # complete 是真正的断点（#88：begin 成功、complete 回 400）。
-        # 单独包 try/except，把「调用异常」和「面板回 400」两种情况分开记。
+        # complete 需要 cf-turnstile-response（#88：不带就固定回 400）。
+        # 先读页面上现成的 token；没有就用 pass_turnstile（系统级鼠标 + 断 webdriver
+        # 重渲染）现场过盾再读——阿滨试过 turnstile.render() 等回调，45 秒拿不到，
+        # 能过的只有上游这套。
+        token = ""
         try:
-            r2 = panel_api(sb, "GET", "/api/client/renewal/complete")
+            open_server(sb, url)
+            sb.sleep(2)
+            token = ts_token(sb) or ""
+            if not token:
+                log(f"{sid}: 页面没有现成 token，走 pass_turnstile 过盾")
+                try:
+                    pass_turnstile(sb, X_RENEW, detach=True, timeout=60)
+                except Exception as e:
+                    log(f"{sid}: pass_turnstile 异常 {type(e).__name__}: {str(e)[:120]}")
+                token = ts_token(sb) or ""
+        except Exception as e:
+            log(f"{sid}: 取 Turnstile token 异常 {type(e).__name__}: {str(e)[:150]}")
+        log(f"{sid}: Turnstile token 长度={len(token)}")
+
+        qs = ("?cf-turnstile-response=" + quote(token, safe="")) if token else ""
+        try:
+            r2 = panel_api(sb, "GET", f"/api/client/renewal/complete{qs}")
         except Exception as e:
             log(f"{sid}: complete 调用异常 {type(e).__name__}: {str(e)[:200]}")
             return None
