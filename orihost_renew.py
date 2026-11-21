@@ -77,7 +77,7 @@ COOKIE_OUT = os.getenv("COOKIE_OUT", "cookie.txt")
 
 TS_IFRAME = 'iframe[src*="challenges.cloudflare.com"]'
 MAX_DAYS = int(os.environ.get("MAX_DAYS", "21"))
-X_RENEW = "//button[normalize-space()='Renew']"
+X_RENEW = "//button[contains(normalize-space(),'Renew')]"
 X_READ = "//button[contains(normalize-space(),'Read Article')]"
 X_CLAIM = "//button[contains(normalize-space(),'Claim Renewal')]"
 X_SIGNIN = "//button[@type='submit' or contains(normalize-space(),'Sign In')]"
