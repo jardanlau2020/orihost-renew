@@ -648,7 +648,8 @@ def read_turnstile_token(page):
     """讀頁面上已生成嘅 Turnstile token。
 
     2026-11-21：面板 complete 接口強制要 `?cf-turnstile-response=`，冇 token
-    一律回 400（run 44790025658 實證：renew/begin 200、complete 400）。
+    一律回 400（run 44790025658 實證：renew/begin 200、complete 400，
+    body = {"detail":"Failed to validate Turnstile data."}）。
     呢個函數**只讀**頁面已 render 嘅 widget 值，唔會自己觸發挑戰、唔會撳掣。
     """
     try:
@@ -658,6 +659,95 @@ def read_turnstile_token(page):
     except Exception as e:
         log(f"   ⚠️ 讀 Turnstile token 異常（{type(e).__name__}）: {str(e)[:120]}")
         return ""
+
+
+# 2026-11-21：面板嘅 Turnstile 係 render=explicit，服務頁上冇人叫佢就唔會出
+# token（run 44885921213 實證：頁面無 token → complete 回 400）。所以唔可以只
+# 「等頁面自己出」，要主動用面板自己嘅 sitekey 渲染一次。
+# sitekey 係公開值，喺 /auth/login 嘅 HTML 入面就有，唔寫死，每次由頁面自己抓
+# （面板換 sitekey 時唔使改代碼）。
+TURNSTILE_RENDER_JS = r"""
+async () => {
+  const grab = async () => {
+    try {
+      const r = await fetch('/auth/login', {credentials: 'same-origin'});
+      const t = await r.text();
+      const m = t.match(/0x4[A-Za-z0-9_\-]{10,}/);
+      return m ? m[0] : '';
+    } catch (e) { return ''; }
+  };
+  const key = window.__ow_sitekey || await grab();
+  if (!key) return {ok: false, why: 'sitekey not found'};
+  window.__ow_sitekey = key;
+  if (!window.turnstile) {
+    try {
+      await new Promise((res, rej) => {
+        const s = document.createElement('script');
+        s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+        s.async = true;
+        s.onload = res;
+        s.onerror = () => rej(new Error('api.js load failed'));
+        document.head.appendChild(s);
+      });
+    } catch (e) {
+      return {ok: false, why: 'load: ' + String(e).slice(0, 100), sitekey: key};
+    }
+  }
+  let box = document.getElementById('ow-ts-box');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'ow-ts-box';
+    box.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;';
+    document.body.appendChild(box);
+  }
+  window.__ow_tok = '';
+  window.__ow_err = '';
+  try {
+    window.turnstile.render(box, {
+      sitekey: key,
+      callback: (t) => { window.__ow_tok = t; },
+      'error-callback': () => { window.__ow_err = 'error'; },
+      'expired-callback': () => { window.__ow_tok = ''; },
+    });
+  } catch (e) {
+    return {ok: false, why: 'render: ' + String(e).slice(0, 120), sitekey: key};
+  }
+  return {ok: true, sitekey: key};
+}
+"""
+
+
+def solve_turnstile(page, timeout=45):
+    """主動渲染面板嘅 Turnstile 並等 token。取唔到就回 ""（唔會拋錯）。"""
+    try:
+        st = page.evaluate(TURNSTILE_RENDER_JS)
+    except Exception as e:
+        log(f"   ⚠️ 主動渲染 Turnstile 異常（{type(e).__name__}）: {str(e)[:140]}")
+        return ""
+    if not isinstance(st, dict) or not st.get("ok"):
+        log(f"   ⚠️ 主動渲染 Turnstile 失敗: {st}")
+        return ""
+    _sk = str(st.get("sitekey") or "")
+    log(f"   🧩 用面板 sitekey {_sk[:16]}… 渲染 Turnstile，等 token（上限 {timeout}s）")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            tok = page.evaluate("() => window.__ow_tok || ''") or ""
+        except Exception:
+            tok = ""
+        if tok:
+            log(f"   ✅ Turnstile token 已取得（{len(tok)} 字）")
+            return tok
+        try:
+            err = page.evaluate("() => window.__ow_err || ''") or ""
+        except Exception:
+            err = ""
+        if err:
+            log(f"   ⚠️ Turnstile 報錯：{err}")
+            return ""
+    log(f"   ⚠️ {timeout}s 內未取得 Turnstile token")
+    return ""
 
 
 def api_renew(page, sid):
@@ -677,7 +767,12 @@ def api_renew(page, sid):
     time.sleep(min(dwell, 120) + 2)
     # 2026-11-21：complete 必須帶 cf-turnstile-response，否則面板回 400
     # （前端自己係 `complete?cf-turnstile-response=<token>`，見 run 44790025658）。
+    # 面板 Turnstile 係 render=explicit，頁面唔會自己出 token（run 44885921213
+    # 實證），所以先讀現成值，冇就主動渲染一次攞。
     token = read_turnstile_token(page)
+    if not token:
+        log("   ⓘ 頁面無現成 Turnstile token → 主動渲染面板 widget")
+        token = solve_turnstile(page)
     qs = f"?cf-turnstile-response={_url_quote(token, safe='')}" if token else ""
     if token:
         log(f"   🔑 帶 Turnstile token（{len(token)} 字）呼叫 complete")
