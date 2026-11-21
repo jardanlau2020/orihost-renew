@@ -69,16 +69,22 @@ jobs:
 
           echo "📥 生成配置"
           mkdir -p ./mihomo-home
-          if [ "$HAVE_URL" = 1 ] && curl -fsSL --retry 2 --max-time 30 -o ./mihomo-home/config.yaml "$HOME_SUB_URL"; then
-            echo "✅ 订阅地址可用"
-          elif [ "$HAVE_GZ" = 1 ]; then
-            echo "📦 用 HOME_SUB_GZ 还原配置"
+          # 优先 HOME_SUB_GZ：它来自本地 home_sub.yaml（2633 行全 vless，无坏节点）。
+          # HOME_SUB_URL 拉下来的那份含 ss 节点且 tls-crypt 为空，mihomo 会
+          # "Parse config error: proxy 63: '' has unset fields: tls-crypt" 直接挂。
+          if [ "$HAVE_GZ" = 1 ]; then
+            echo "📦 用 HOME_SUB_GZ 还原配置（首选）"
             echo "$HOME_SUB_GZ" | base64 -d | gunzip > ./mihomo-home/config.yaml
+          elif [ "$HAVE_URL" = 1 ] && curl -fsSL --retry 2 --max-time 30 -o ./mihomo-home/config.yaml "$HOME_SUB_URL"; then
+            echo "✅ 订阅地址可用（fallback）"
           else
-            echo "❌ 订阅地址拉取失败且无 HOME_SUB_GZ 可用"
+            echo "❌ 无可用配置来源"
             exit 1
           fi
+          # 清理会让 mihomo 解析失败的空字段（ss 节点的 tls-crypt / 空密码等）
+          sed -i -E "/^[[:space:]]*tls-crypt:[[:space:]]*('{2}|\"{2})?[[:space:]]*$/d" ./mihomo-home/config.yaml
           echo "--- config.yaml 前 3 行 ---"; head -3 ./mihomo-home/config.yaml
+          echo "--- proxies 数量 ---"; grep -c "^  - name:" ./mihomo-home/config.yaml || true
 
           nohup ./mihomo-bin -d ./mihomo-home -f ./mihomo-home/config.yaml > mihomo.log 2>&1 &
           echo "MIHOMO_PID=$!" >> "$GITHUB_ENV"
