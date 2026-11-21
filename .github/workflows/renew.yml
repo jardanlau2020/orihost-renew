@@ -148,12 +148,17 @@ jobs:
           which Xvfb || { echo "❌ Xvfb 没装上"; exit 1; }
           which xvfb-run || { echo "❌ xvfb-run 没装上"; exit 1; }
           echo "DISPLAY 由 xvfb-run 提供"
-          # 硬上限 300 秒：run #73 跑满 332 秒才发现 driver 起不来，不烧 CI。
-          # 注意 tee 会吞掉退出码，所以取 PIPESTATUS。
-          timeout 300 xvfb-run -a --server-args="-screen 0 1920x1080x24" \
-            python orihost_renew.py 2>&1 | tee raw.log
-          rc=${PIPESTATUS[0]}
+          # 上限 600 秒 + -k 10：run #82 是活着跑到 300 秒被掐（exit 124），
+          # 说明 300 秒不够走完登录+续期；-k 保证超时后连子进程一起收。
+          # tee 移出管道：`timeout ... | tee` 只杀 timeout 那一侧，python 和 tee
+          # 可能变成孤儿继续跑，导致这一步超时不退。先重定向，结束后再 tail。
+          set +e
+          timeout -k 10 600 xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            python orihost_renew.py > raw.log 2>&1
+          rc=$?
           echo "python exit code: $rc"
+          echo "--- raw.log 尾部 120 行 ---"
+          tail -120 raw.log || true
           exit $rc
 
       - name: 💾 回写 ORIHOST_COOKIE
