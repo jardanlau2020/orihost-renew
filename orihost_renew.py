@@ -619,7 +619,12 @@ def read_article(sb, sid, main):
     kill_overlays(sb)
 
 
-API_RENEW = os.getenv("API_RENEW", "1").strip().lower() not in ("0", "false", "no", "")
+# 2026-11-21 run #88：renew/begin 200，但 renewal/complete 固定回 400
+# （面板要求 ?cf-turnstile-response=<token>，上游没带）。阿滨早期试过主动渲染
+# Turnstile 等 token，45 秒拿不到，那条路走死了。所以默认关掉接口续期，
+# 强制走页面流程——页面流程里的 pass_turnstile() 用系统级鼠标点 + 断开重渲染，
+# 是上游能过 CF 的那条路。要重新启用接口续期：API_RENEW=1。
+API_RENEW = os.getenv("API_RENEW", "0").strip().lower() in ("1", "true", "yes")
 
 
 def api_renew(sb, sid, url, before):
