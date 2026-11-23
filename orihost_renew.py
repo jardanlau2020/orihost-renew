@@ -20,7 +20,7 @@ import json
 import os
 import re
 import sys
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 import threading
 import time
 from datetime import datetime
@@ -510,10 +510,14 @@ def renewal_days(sb):
 
 
 API_JS = r"""
-const [method, path, body, done] = [arguments[0], arguments[1], arguments[2], arguments[arguments.length - 1]];
+const [method, path, body, tokenIn, done] = [arguments[0], arguments[1], arguments[2], arguments[3], arguments[arguments.length - 1]];
 const m = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
 const h = {"Accept": "application/json", "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"};
-if (m) h["X-XSRF-TOKEN"] = decodeURIComponent(m[1]);
+// 2026-11-23：优先用 Python 从 cookie jar 重读的 token（见 fresh_xsrf）。
+// document.cookie 里同名 cookie 可能有 path 不同的重复项，match 会取到靠前那条，
+// 常常就是 session 重签发之前的旧值 —— 拿旧值当 X-XSRF-TOKEN 服务端比对必然 419。
+if (tokenIn) h["X-XSRF-TOKEN"] = tokenIn;
+else if (m) h["X-XSRF-TOKEN"] = decodeURIComponent(m[1]);
 fetch(path, {method, headers: h, credentials: "same-origin", body: body ? JSON.stringify(body) : undefined})
   .then(async r => done({status: r.status, text: await r.text()}))
   .catch(e => done({status: 0, text: String(e)}));
@@ -523,10 +527,42 @@ AUTO_START_SKIP = {x.strip() for x in os.getenv("AUTO_START_SKIP", "").split(","
 AUTO_START = os.getenv("AUTO_START", "1").strip().lower() not in ("0", "false", "no", "")
 
 
-def panel_api(sb, method, path, body=None):
-    """用浏览器里已登录的会话调用面板 client API（同源 fetch，带 XSRF）。"""
+def panel_api(sb, method, path, body=None, xsrf=None):
+    """用浏览器里已登录的会话调用面板 client API（同源 fetch，带 XSRF）。
+
+    xsrf 显式传入时以它为准（Python 从 cookie jar 重读的那份）。
+    """
     sb.driver.set_script_timeout(20)
-    return sb.driver.execute_async_script(API_JS, method, path, body)
+    return sb.driver.execute_async_script(API_JS, method, path, body, xsrf or "")
+
+
+def fresh_xsrf(sb) -> str:
+    """从当前 cookie jar 重读 XSRF-TOKEN（URL 解码后可直接当 X-XSRF-TOKEN 头）。
+
+    2026-11-23 阿华定位（run 45000404309：`接口续期 begin 返回 419
+    {"detail":"CSRF token mismatch"}`）：419 不是「cookie 过期」。Laravel 的 XSRF-TOKEN
+    cookie 在登录那一刻会随 session 重新签发，注入/早期读到的是旧值，服务端拿它跟
+    session token 比对就对不上。正确动作是「重新导航 -> 重读 XSRF -> 重试一次」，不是重登。
+
+    走 driver.get_cookies() 而不是 document.cookie：同名 cookie 可能有 path 不同的重复项，
+    document.cookie 的正则只会匹配到靠前那条。用 Python 读 jar 才能拿到最新的。
+    """
+    raw = ""
+    try:
+        cand = [c for c in (sb.driver.get_cookies() or [])
+                if c.get("name", "").upper() == "XSRF-TOKEN"]
+        if cand:
+            root = [c for c in cand if c.get("path") == "/"]
+            raw = ((root or cand)[-1].get("value") or "").strip()
+    except Exception as e:
+        log(f"读 cookie jar 里的 XSRF-TOKEN 失败 {type(e).__name__}: {str(e)[:120]}")
+    if not raw:
+        try:
+            raw = sb.execute_script(
+                "var m=document.cookie.match(/XSRF-TOKEN=([^;]+)/);return m?m[1]:'';") or ""
+        except Exception:
+            raw = ""
+    return unquote(raw)
 
 
 def fmt_uptime(ms):
@@ -656,13 +692,41 @@ def api_renew(sb, sid, url, before):
     """接口续期（参考 JJJuines/orihost-renew）：renew/begin -> 等 dwell_seconds -> renewal/complete。
     成功返回续期后的天数；任何异常/未生效返回 None，交给页面点击流程兜底。"""
     try:
-        r = panel_api(sb, "POST", f"/api/client/servers/{sid}/renew/begin")
+        def _begin(xsrf):
+            try:
+                return panel_api(sb, "POST", f"/api/client/servers/{sid}/renew/begin",
+                                 xsrf=xsrf)
+            except Exception as e:
+                log(f"{sid}: begin 调用异常 {type(e).__name__}: {str(e)[:150]}")
+                return None
+
+        xsrf = fresh_xsrf(sb)
+        r = _begin(xsrf)
         st = r.get("status") if r else None
         if st != 200:
-            log(f"{sid}: 接口续期 begin 返回 {st}：{(r or {}).get('text', '')[:120]}，改用页面流程")
-            if st == 419:
-                raise RuntimeError("CSRF token mismatch")
-            return None
+            # 2026-11-23 阿华定位：419 不是 cookie 过期，是 XSRF-TOKEN 旧值对不上 session。
+            # 旧写法在这里 `raise RuntimeError("CSRF token mismatch")`，等于把「改用页面流程」
+            # 这条兜底路掐断：异常冒到 _run_browser 去走「清 cookie 重登录」，而 ORIHOST_COOKIE
+            # 凭证路径根本没有 EMAIL/PASSWORD，重登必崩（run 45000404309：419 -> 重登抛错 ->
+            # results 为空 -> 0/0 假绿）。
+            # 现在：重新导航让面板下发新 XSRF -> 从 cookie jar 重读 -> 原请求重试一次；
+            # 仍不是 200 就 return None，把兜底让给页面流程，绝不在这里抛。
+            log(f"{sid}: 接口续期 begin 返回 {st}：{(r or {}).get('text', '')[:120]}，"
+                f"重读 XSRF 后重试一次")
+            try:
+                open_server(sb, url)
+                sb.sleep(2)
+            except Exception as e:
+                log(f"{sid}: 重新导航取新 XSRF 失败 {type(e).__name__}: {str(e)[:120]}")
+            xsrf2 = fresh_xsrf(sb)
+            log(f"{sid}: XSRF 重读完成（长度 {len(xsrf2)}，变化={xsrf2 != xsrf}）")
+            r = _begin(xsrf2)
+            st = r.get("status") if r else None
+            if st != 200:
+                log(f"{sid}: 重试后 begin 仍是 {st}："
+                    f"{(r or {}).get('text', '')[:120]}，改用页面流程")
+                return None
+            log(f"{sid}: 重读 XSRF 后 begin 通过")
         try:
             dwell = int(json.loads(r["text"]).get("dwell_seconds") or 15)
         except Exception:
@@ -701,11 +765,19 @@ def api_renew(sb, sid, url, before):
         log(f"{sid}: Turnstile token 长度={len(token)}")
 
         qs = ("?cf-turnstile-response=" + quote(token, safe="")) if token else ""
-        try:
-            r2 = panel_api(sb, "GET", f"/api/client/renewal/complete{qs}")
-        except Exception as e:
-            log(f"{sid}: complete 调用异常 {type(e).__name__}: {str(e)[:200]}")
-            return None
+
+        def _complete(xsrf):
+            try:
+                return panel_api(sb, "GET", f"/api/client/renewal/complete{qs}", xsrf=xsrf)
+            except Exception as e:
+                log(f"{sid}: complete 调用异常 {type(e).__name__}: {str(e)[:200]}")
+                return None
+
+        r2 = _complete(fresh_xsrf(sb))
+        if r2 and r2.get("status") == 419:
+            # 同上：419 重读 XSRF 后重试一次，别把后面的判据和页面兜底一起掐掉。
+            log(f"{sid}: complete 返回 419，重读 XSRF 后重试一次")
+            r2 = _complete(fresh_xsrf(sb))
         log(f"{sid}: complete 原始返回 status={r2.get('status') if r2 else None} "
             f"body={((r2 or {}).get('text') or '')[:500]}")
         try:
@@ -1001,17 +1073,24 @@ def _run_browser(kw, results, state):
                     rec["error"] = msg
                     dump_buttons(sb, f"{sid}失败{attempt}")
                     log(f"{u} 第 {attempt} 次续期失败：{msg}")
-                    if "CSRF" in msg:  # 会话 token 不一致 -> 清 cookie 用账号密码重新登录
+                    if "CSRF" in msg:  # 会话 token 不一致
                         # 2026-11-23：CSRF 不一致必须显式记成失败信号。
                         # 实证 run 45000404309：CSRF -> 清 cookie 重登 -> 重登抛错 -> results 为空
                         # -> 旧版 `any(not r["ok"] for r in results)` 在空列表上恒 False -> 0/0 绿。
                         state["csrf_mismatch"] = True
-                        log("CSRF 不一致，清除 cookie 后重新登录")
-                        global COOKIE
-                        COOKIE = ""
-                        sb.driver.delete_all_cookies()
-                        login(sb)
-                        save_cookies(sb)
+                        # 阿华 L327：ORIHOST_COOKIE 凭证路径没有 EMAIL/PASSWORD，login() 会直接
+                        # raise「未登录且没有设置 ORIHOST_EMAIL / ORIHOST_PASSWORD」，一崩就把整轮
+                        # 变成 results 为空。没有重登手段就不重登，如实按失败上报。
+                        if EMAIL and PASSWORD:
+                            log("CSRF 不一致，清除 cookie 后重新登录")
+                            global COOKIE
+                            COOKIE = ""
+                            sb.driver.delete_all_cookies()
+                            login(sb)
+                            save_cookies(sb)
+                        else:
+                            log("CSRF 不一致，但当前凭证路径没有 EMAIL/PASSWORD，"
+                                "跳过重登录，本轮按失败上报")
             if not rec["ok"]:
                 try:
                     rec["before"] = renewal_days(sb)
