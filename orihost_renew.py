@@ -454,6 +454,12 @@ def start_heartbeat(interval=20):
     t.start()
     return stop
 
+#: 心跳线程的停止事件：_run_browser() 里创建，main() 的 finally 里停止。
+#: 必须定义在模块级 —— 原先是 _run_browser() 的局部变量，main() 里
+#: `hb_stop.set()` 抛 NameError 被 `except Exception: pass` 吞掉，
+#: 心跳线程从来没被停过（每台服务器叠一条，进程退出才收）。
+hb_stop = None
+
 
 def close_extra_tabs(sb, main):
     for h in list(driver_call(sb, lambda: sb.driver.window_handles)):
@@ -949,6 +955,9 @@ def _run_browser(kw, results, state):
                 "driver 启动后连不上（window_handles 失败）→ 检查 Xvfb / Chrome / "
                 "图形依赖；workflow 必须用 xvfb-run 包住 python 命令")
         log("✅ driver 健康检查通过")
+        global hb_stop
+        if hb_stop is not None:      # driver 重试会再进一次，先收掉上一条心跳
+            hb_stop.set()
         hb_stop = start_heartbeat()
         step("登录")
         try:
@@ -1057,7 +1066,8 @@ def main():
         log("运行异常：", e)
     finally:
         try:
-            hb_stop.set()
+            if hb_stop is not None:
+                hb_stop.set()
         except Exception:
             pass
         try:
