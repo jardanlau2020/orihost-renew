@@ -1063,7 +1063,13 @@ def main():
 
     ok = sum(1 for r in results if r["ok"])
     log(f"完成：{ok}/{len(results)} 台成功续期")
-    sys.exit(1 if state["login_error"] or any(not r["ok"] for r in results) else 0)
+    # 2026-11-23 修假绿：results 为空时 any([]) 为 False，旧式三元式会 exit 0 →
+    # 日志「完成：0/0 台成功续期」却红灯变绿灯。0 台成功一律判失败；
+    # 部分失败（ok < len）沿用原语义，同样非零。
+    if ok == 0:
+        log("❌ 0 台成功续期 → 判失败（exit 1）")
+        sys.exit(1)
+    sys.exit(0 if ok == len(results) else 1)
 
 
 if __name__ == "__main__":
