@@ -32,6 +32,11 @@ EMAIL = os.getenv("ORIHOST_EMAIL", "")
 PASSWORD = os.getenv("ORIHOST_PASSWORD", "")
 COOKIE = os.getenv("ORIHOST_COOKIE", "").strip()
 
+# 心跳线程的停止事件。原先只在 _run_browser() 里当局部变量赋值，main() 的
+# finally 却直接用它 → NameError 被 except 吞掉，心跳线程到进程退出才停；
+# 静态检查也会报 F821。提到模块级，两边指同一个对象。
+hb_stop = None
+
 # ── 本仓补丁：三级凭证解析（上游只有 EMAIL/PASSWORD 与 COOKIE 两级）──────────
 # 优先级 1: ORIHOST_EMAIL + ORIHOST_PASSWORD（上游主线）
 # 优先级 2: ORIHOST_COOKIE（整段 cookie 串）
@@ -453,12 +458,6 @@ def start_heartbeat(interval=20):
     t = threading.Thread(target=_beat, daemon=True)
     t.start()
     return stop
-
-#: 心跳线程的停止事件：_run_browser() 里创建，main() 的 finally 里停止。
-#: 必须定义在模块级 —— 原先是 _run_browser() 的局部变量，main() 里
-#: `hb_stop.set()` 抛 NameError 被 `except Exception: pass` 吞掉，
-#: 心跳线程从来没被停过（每台服务器叠一条，进程退出才收）。
-hb_stop = None
 
 
 def close_extra_tabs(sb, main):
@@ -956,8 +955,6 @@ def _run_browser(kw, results, state):
                 "图形依赖；workflow 必须用 xvfb-run 包住 python 命令")
         log("✅ driver 健康检查通过")
         global hb_stop
-        if hb_stop is not None:      # driver 重试会再进一次，先收掉上一条心跳
-            hb_stop.set()
         hb_stop = start_heartbeat()
         step("登录")
         try:
@@ -1066,8 +1063,7 @@ def main():
         log("运行异常：", e)
     finally:
         try:
-            if hb_stop is not None:
-                hb_stop.set()
+            hb_stop.set()
         except Exception:
             pass
         try:
