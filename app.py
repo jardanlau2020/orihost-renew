@@ -1100,10 +1100,21 @@ def main():
                     log("🔓 窗口開咗 → 試接口續期（繞過 Turnstile）")
                     if api_renew(page, SERVER_SHORT_ID):
                         new_days = get_renewal_days(page)
-                        new_due = f"剩余 {new_days} 天" if new_days is not None else "已續期"
-                        log(f"✅ 接口續期成功：{old_due} → {new_due}")
-                        send_telegram_notification("✅ 接口續期成功（免人手）", old_due, new_due, current_ip)
-                        sys.exit(0)
+                        # 2026-11-23 修假成功：接口回 200 不等于真的加了天数。
+                        # 读不到新天数时不再猜「已續期」，按未确认处理并标红告警。
+                        if old_days is not None and new_days is not None and new_days > old_days:
+                            new_due = f"剩余 {new_days} 天"
+                            log(f"✅ 接口續期成功：{old_due} → {new_due}")
+                            send_telegram_notification(
+                                "✅ 接口續期成功（免人手）", old_due, new_due, current_ip)
+                            sys.exit(0)
+                        log(f"⚠️ 接口返回成功但天数未增加（旧 {old_days} → 新 {new_days}）→ 不判成功")
+                        send_telegram_notification(
+                            "⚠️ 接口續期未能確認",
+                            old_due,
+                            f"剩余 {new_days} 天" if new_days is not None else "讀唔到新天數",
+                            current_ip)
+                        sys.exit(1)
                     log("⚠️ 接口續期未成功 → 退回 watchdog 提醒（要人手撳）")
                     log("🔔【可續期窗口已開】watchdog 模式唔會自動撳，已 TG 提醒人手")
                     send_telegram_notification(
