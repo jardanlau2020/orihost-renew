@@ -6,6 +6,7 @@
 #   → 回面板等倒计时 → 过 Turnstile → 点 Claim Renewal → complete 完成（+7 天）
 # 右侧悬浮广告不影响，直接忽略；中央广告是外部广告商(ldrws)动态下发，只按关闭按钮匹配
 
+import json
 import os
 import re
 import sys
@@ -1100,7 +1101,22 @@ def main():
                     log("🔓 窗口開咗 → 試接口續期（繞過 Turnstile）")
                     if api_renew(page, SERVER_SHORT_ID):
                         new_days = get_renewal_days(page)
-                        new_due = f"剩余 {new_days} 天" if new_days is not None else "已續期"
+                        # 2026-11-23 修假成功：接口回了 renewed_count>0，但「续期后天数」读不到时
+                        # 旧版写死 new_due="已續期" 直接 sys.exit(0) 报成功 —— 读不到 ≠ 续上了。
+                        # 这里改判 UNKNOWN：发告警 + 非零退出，让 Actions 标红，不许静默当成功。
+                        if new_days is None:
+                            log("⚠️ 接口續期已提交，但讀唔到續期後剩餘天數 → 判 UNKNOWN（不當成功）")
+                            send_telegram_notification(
+                                "⚠️ 接口續期結果未知（讀唔到續期後到期日，請人手核對）",
+                                old_due, "未知", current_ip)
+                            sys.exit(2)
+                        new_due = f"剩余 {new_days} 天"
+                        if old_days is not None and new_days <= old_days:
+                            log(f"⚠️ 續期後天數冇增加（{old_days} → {new_days}）→ 判 UNKNOWN")
+                            send_telegram_notification(
+                                "⚠️ 接口續期結果未知（續期後天數未增加，請人手核對）",
+                                old_due, new_due, current_ip)
+                            sys.exit(2)
                         log(f"✅ 接口續期成功：{old_due} → {new_due}")
                         send_telegram_notification("✅ 接口續期成功（免人手）", old_due, new_due, current_ip)
                         sys.exit(0)
