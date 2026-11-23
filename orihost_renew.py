@@ -713,7 +713,10 @@ def api_renew(sb, sid, url, before):
             return None
         after = open_server(sb, url)
         log(f"{sid}: {before} 天 -> {after} 天（接口）")
-        if after is not None and (before is None or after > before or after >= MAX_DAYS):
+        # 2026-11-23 冷王 #89：`before is None` 说明续期前没读到天数 —— 没有基准
+        # 就没有「比原来晚」的证据，这属于「读不到」，不能当成功返回。
+        # 原写法 `before is None or ...` 会把「续期前页面没加载出来」变成 ✅。
+        if before is not None and after is not None and (after > before or after >= MAX_DAYS):
             return after
         return None
     except RuntimeError:
