@@ -990,6 +990,10 @@ def _run_browser(kw, results, state):
                     dump_buttons(sb, f"{sid}失败{attempt}")
                     log(f"{u} 第 {attempt} 次续期失败：{msg}")
                     if "CSRF" in msg:  # 会话 token 不一致 -> 清 cookie 用账号密码重新登录
+                        # 2026-11-23：CSRF 不一致必须显式记成失败信号。
+                        # 实证 run 45000404309：CSRF -> 清 cookie 重登 -> 重登抛错 -> results 为空
+                        # -> 旧版 `any(not r["ok"] for r in results)` 在空列表上恒 False -> 0/0 绿。
+                        state["csrf_mismatch"] = True
                         log("CSRF 不一致，清除 cookie 后重新登录")
                         global COOKIE
                         COOKIE = ""
@@ -1027,7 +1031,7 @@ def main():
         kw["proxy"] = proxy_url.split("://", 1)[-1]  # SB 要 host:port
 
     results = []
-    state = {"login_error": None}
+    state = {"login_error": None, "csrf_mismatch": False}
     try:
         # load藤 #73 要求：seleniumbase 报 localhost:port refused 时重启 driver 重试一次，
         # 别整个 run 直接挂。这里直接重开整只浏览器（driver 半路死了重连不可靠）。
@@ -1063,7 +1067,27 @@ def main():
 
     ok = sum(1 for r in results if r["ok"])
     log(f"完成：{ok}/{len(results)} 台成功续期")
-    sys.exit(1 if state["login_error"] or any(not r["ok"] for r in results) else 0)
+
+    # 2026-11-23 修「退出码不跟结果走」：
+    #   旧写法 sys.exit(1 if login_error or any(not r["ok"] for r in results) else 0)
+    #   在 results 为空时 any(...) 恒为 False → 一台没成也报 0/0 且 job 绿灯。
+    # 现在：登录失败 / 结果为空 / 零成功 / 存在失败项 / 出现 CSRF 不一致，任一命中即非零退出。
+    reasons = []
+    if state.get("login_error"):
+        reasons.append(f"登录失败（{state['login_error']}）")
+    if not results:
+        reasons.append("结果为空（0/0，没有任何一台进入续期流程）")
+    elif ok == 0:
+        reasons.append(f"零成功（{ok}/{len(results)}）")
+    if any(not r["ok"] for r in results):
+        reasons.append(f"存在失败项（{len(results) - ok} 台）")
+    if state.get("csrf_mismatch"):
+        reasons.append("出现 CSRF token mismatch（会话不一致，本轮不可信）")
+
+    if reasons:
+        log("❌ 本轮判失败：" + "；".join(reasons) + " → 退出码 1")
+        sys.exit(1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
